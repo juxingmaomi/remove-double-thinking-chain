@@ -1,24 +1,28 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.4
+// version: v0.0.5
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.4';
+  const SCRIPT_VERSION = 'v0.0.5';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const STORAGE_KEY = 'th_remove_double_thinking_chain_settings_v1';
   const LOG_KEY = 'th_remove_double_thinking_chain_logs_v1';
+  const TRUNCATED_GUARD_KEY = 'th_remove_double_thinking_chain_truncated_guards_v1';
+  const BACKUP_INDEX_KEY = 'th_remove_double_thinking_chain_backup_dates_v1';
+  const BACKUP_DAY_KEY_PREFIX = 'th_remove_double_thinking_chain_deleted_backup_v1:';
   const STYLE_ID = 'th-remove-double-thinking-chain-style-v1';
   const WIDGET_ID = 'th-remove-double-thinking-chain-widget';
   const FLOATING_BUTTON_ID = 'th-remove-double-thinking-chain-floating-button';
   const PANEL_ID = 'th-remove-double-thinking-chain-panel';
   const MAX_LOGS = 80;
+  const MAX_BACKUP_DAYS = 14;
 
   const DEFAULT_SETTINGS = {
     enabled: true,
@@ -252,6 +256,23 @@
     return next;
   }
 
+  function loadTruncatedGuards() {
+    try {
+      const guards = JSON.parse(sessionStorage.getItem(TRUNCATED_GUARD_KEY) || '[]');
+      return Array.isArray(guards) ? guards.filter((item) => typeof item === 'string') : [];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function saveTruncatedGuards(guards) {
+    try {
+      sessionStorage.setItem(TRUNCATED_GUARD_KEY, JSON.stringify(Array.from(new Set(guards || [])).slice(-200)));
+    } catch (error) {
+      console.warn(`[${SCRIPT_NAME}] 保存截断保险丝失败`, error);
+    }
+  }
+
   function loadLogs() {
     try {
       const logs = JSON.parse(localStorage.getItem(LOG_KEY) || '[]');
@@ -263,6 +284,117 @@
 
   function saveLogs(logs) {
     localStorage.setItem(LOG_KEY, JSON.stringify((logs || []).slice(0, MAX_LOGS)));
+  }
+
+  function getLocalDateKey(date) {
+    const value = date instanceof Date ? date : new Date();
+    const year = value.getFullYear();
+    const month = String(value.getMonth() + 1).padStart(2, '0');
+    const day = String(value.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  function getBackupStorageKey(dateKey) {
+    return `${BACKUP_DAY_KEY_PREFIX}${dateKey}`;
+  }
+
+  function loadBackupDates() {
+    try {
+      const dates = JSON.parse(localStorage.getItem(BACKUP_INDEX_KEY) || '[]');
+      return Array.isArray(dates) ? dates.filter((item) => typeof item === 'string') : [];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function saveBackupDates(dates) {
+    const uniqueDates = Array.from(new Set(dates || [])).sort().slice(-MAX_BACKUP_DAYS);
+    localStorage.setItem(BACKUP_INDEX_KEY, JSON.stringify(uniqueDates));
+    return uniqueDates;
+  }
+
+  function loadDeletedBackups(dateKey) {
+    try {
+      const backups = JSON.parse(localStorage.getItem(getBackupStorageKey(dateKey)) || '[]');
+      return Array.isArray(backups) ? backups : [];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function pruneOldBackups(keepDateKey) {
+    const dates = loadBackupDates().sort();
+    const keptDates = dates.slice(-MAX_BACKUP_DAYS);
+    dates.forEach((dateKey) => {
+      if (dateKey !== keepDateKey && !keptDates.includes(dateKey)) {
+        localStorage.removeItem(getBackupStorageKey(dateKey));
+      }
+    });
+    saveBackupDates(keptDates.concat(keepDateKey ? [keepDateKey] : []));
+  }
+
+  function saveDeletedBackup(entry) {
+    const now = new Date();
+    const dateKey = getLocalDateKey(now);
+    const backup = Object.assign({
+      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      time: now.toISOString(),
+      date: dateKey,
+    }, entry || {});
+    const backups = loadDeletedBackups(dateKey);
+    backups.push(backup);
+    try {
+      localStorage.setItem(getBackupStorageKey(dateKey), JSON.stringify(backups));
+      saveBackupDates(loadBackupDates().concat(dateKey));
+      pruneOldBackups(dateKey);
+      return { ok: true, dateKey };
+    } catch (error) {
+      console.warn(`[${SCRIPT_NAME}] 保存被删除内容失败`, error);
+      return { ok: false, error: error.message || String(error), dateKey };
+    }
+  }
+
+  function buildBackupText(dateKey) {
+    const backups = loadDeletedBackups(dateKey);
+    if (!backups.length) return '';
+    return backups.map((backup, index) => [
+      `#${index + 1}`,
+      `时间：${formatTime(backup.time)}`,
+      `楼层：${backup.floorLabel || '未知楼层'}`,
+      `前 10 字：${backup.snippet || '（空）'}`,
+      `删除字符数：${backup.removedCount || String(backup.text || '').length}`,
+      '',
+      String(backup.text || ''),
+      '',
+      '---',
+      '',
+    ].join('\n')).join('');
+  }
+
+  function downloadTextFile(filename, text) {
+    const doc = getHostDocument();
+    const host = getHostWindow();
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = host.URL.createObjectURL(blob);
+    const link = doc.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.style.display = 'none';
+    doc.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => host.URL.revokeObjectURL(url), 1000);
+  }
+
+  function exportTodayBackups() {
+    const dateKey = getLocalDateKey(new Date());
+    const text = buildBackupText(dateKey);
+    if (!text) {
+      notify('info', '今天还没有可导出的删除备份。');
+      return;
+    }
+    downloadTextFile(`去除双思维链-删除备份-${dateKey}.txt`, text);
+    notify('success', `已导出 ${dateKey} 的删除备份 TXT`);
   }
 
   function addLog(entry) {
@@ -559,6 +691,12 @@
       .th-rdt-section-title {
         font-size: 13px;
         font-weight: 800;
+      }
+      .th-rdt-actions {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        justify-content: flex-end;
       }
       .th-rdt-btn {
         min-height: 30px;
@@ -949,7 +1087,10 @@
         <section class="th-rdt-card">
           <div class="th-rdt-section-head">
             <div class="th-rdt-section-title">停止日志</div>
-            <button type="button" class="th-rdt-btn danger" data-action="clear-logs">清空日志</button>
+            <div class="th-rdt-actions">
+              <button type="button" class="th-rdt-btn" data-action="export-backups">导出今日备份</button>
+              <button type="button" class="th-rdt-btn danger" data-action="clear-logs">清空日志</button>
+            </div>
           </div>
           <div class="th-rdt-log-list">
             ${buildLogHtml()}
@@ -970,6 +1111,8 @@
         closePanel();
       } else if (action === 'clear-logs') {
         if (confirm('确定清空停止日志吗？')) clearLogs();
+      } else if (action === 'export-backups') {
+        exportTodayBackups();
       }
     });
     panel.addEventListener('change', (event) => {
@@ -1361,6 +1504,19 @@
       cancelTask(task, '截断点无效，取消自动截断');
       return;
     }
+    const removedText = rawText.slice(detection.thinkingIndex);
+    const backupResult = saveDeletedBackup({
+      floorLabel: task.floorLabel,
+      floorNumber: Number.isFinite(writable.index) ? writable.index + 1 : null,
+      rawMesid: task.rawMesid || '',
+      snippet: detection.snippet || task.snippet,
+      removedCount: removedText.length,
+      text: removedText,
+    });
+    if (!backupResult.ok) {
+      cancelTask(task, `保存删除备份失败，已取消自动截断以保护内容：${backupResult.error}`);
+      return;
+    }
     applyRecordText(writable.record, truncated);
     markAutoTruncated(latest, task, writable);
     refreshMessageBlock(writable);
@@ -1376,6 +1532,7 @@
       snippet: detection.snippet || task.snippet,
       truncateMethod: `已删除 ${removedCount} 字符`,
       truncateError: '',
+      backupDate: backupResult.dateKey,
       truncatedAt: new Date().toISOString(),
     });
     setGuardStatus(`已精确删除 ${task.floorLabel} 第二个 <thinking> 起的 ${removedCount} 个字符。`, 'warning');
@@ -1491,16 +1648,50 @@
     return `node:${getWeakNodeId(node)}`;
   }
 
+  function normalizeGuardPart(value) {
+    return String(value == null ? '' : value).trim().replace(/\s+/g, ' ').slice(0, 120) || 'unknown';
+  }
+
+  function getGuardScope() {
+    const context = getTavernContext();
+    const host = getHostWindow();
+    const parts = [];
+    if (context) {
+      parts.push(`chat:${normalizeGuardPart(context.chatId)}`);
+      parts.push(`character:${normalizeGuardPart(context.characterId)}`);
+      parts.push(`group:${normalizeGuardPart(context.groupId)}`);
+      parts.push(`name:${normalizeGuardPart(context.name2)}`);
+    }
+    try {
+      parts.push(`path:${normalizeGuardPart(host.location && host.location.pathname)}`);
+    } catch (error) {
+      parts.push('path:unknown');
+    }
+    return parts.join('|');
+  }
+
+  function getScopedGuardKeys(keys) {
+    const scope = getGuardScope();
+    return (keys || []).map((key) => `scope:${scope}::${key}`);
+  }
+
   function getAutoTruncatedKeys(message, task, writable) {
     const keys = new Set();
     if (message) {
       const key = getMessageKey(message);
       if (key && key !== 'none') keys.add(key);
+      if (Number.isFinite(message.index)) {
+        keys.add(`visible-index:${message.index}`);
+        keys.add(`floor:${message.index + 1}`);
+      }
       const index = getNumericMessageId(message);
       if (Number.isFinite(index)) {
         keys.add(`mesid:${index}`);
         keys.add(`floor:${index + 1}`);
       }
+      const floor = getFloorInfo(message);
+      if (Number.isFinite(floor.floorNumber)) keys.add(`floor:${floor.floorNumber}`);
+      if (floor.rawMesid != null && String(floor.rawMesid).trim() !== '') keys.add(`mesid:${String(floor.rawMesid).trim()}`);
     }
     if (task) {
       if (task.key) keys.add(task.key);
@@ -1519,12 +1710,40 @@
   }
 
   function markAutoTruncated(message, task, writable) {
-    getAutoTruncatedKeys(message, task, writable).forEach((key) => runtime.autoTruncatedKeys.add(key));
+    const keys = getAutoTruncatedKeys(message, task, writable);
+    const scopedKeys = getScopedGuardKeys(keys);
+    keys.concat(scopedKeys).forEach((key) => runtime.autoTruncatedKeys.add(key));
+    saveTruncatedGuards(loadTruncatedGuards().concat(scopedKeys));
+  }
+
+  function hasRecentTruncateLog(message, task, writable) {
+    const floor = getFloorInfo(message);
+    const rawMesid = task && task.rawMesid != null && String(task.rawMesid).trim() !== ''
+      ? String(task.rawMesid).trim()
+      : floor.rawMesid;
+    const writableFloor = writable && Number.isFinite(writable.index) ? writable.index + 1 : null;
+    const floorNumbers = [floor.floorNumber, writableFloor]
+      .filter((value) => Number.isFinite(value))
+      .map((value) => Number(value));
+    const now = Date.now();
+    return loadLogs().some((log) => {
+      if (!log || !log.truncateMethod) return false;
+      const method = String(log.truncateMethod);
+      if (!method.includes('已删除') && !method.toLowerCase().includes('deleted')) return false;
+      const logTime = Date.parse(log.time || '');
+      if (Number.isFinite(logTime) && now - logTime > 12 * 60 * 60 * 1000) return false;
+      if (rawMesid != null && String(rawMesid).trim() !== '' && String(log.rawMesid || '').trim() === String(rawMesid).trim()) return true;
+      return floorNumbers.includes(Number(log.floorNumber));
+    });
   }
 
   function hasAutoTruncated(message, state, task, writable) {
     if (state && state.autoTruncateUsed) return true;
-    return getAutoTruncatedKeys(message, task, writable).some((key) => runtime.autoTruncatedKeys.has(key));
+    const keys = getAutoTruncatedKeys(message, task, writable);
+    const scopedKeys = getScopedGuardKeys(keys);
+    const savedKeys = new Set(loadTruncatedGuards());
+    return keys.concat(scopedKeys).some((key) => runtime.autoTruncatedKeys.has(key) || savedKeys.has(key))
+      || hasRecentTruncateLog(message, task, writable);
   }
 
   function getFloorInfo(message) {

@@ -9,6 +9,7 @@ TavernHelper / SillyTavern 小插件。它会在当前回复的 `</content>` 已
 - 保守检测：只在 `</content>` 之后检测 `<thinking>`，不会拦截最开头的正常思维链。
 - 谨慎处理：可选开启自动截断和截断后自动续写，并可自定义两个等待秒数。
 - 停止日志：记录触发时间、第几楼、触发前 10 个字、停止方式。
+- 删除备份：自动截断前先保存被删除内容，可按自然日导出 TXT。
 - 本地保存：开关与日志保存在浏览器 `localStorage`。
 
 自动截断和自动续写默认关闭；需要测试时请在 🧠 浮窗面板里手动开启。
@@ -20,13 +21,13 @@ TavernHelper / SillyTavern 小插件。它会在当前回复的 `</content>` 已
 3. 警戒状态下发现新的 `<thinking` 开头，立即尝试停止生成。
 4. 如果开启自动截断，等待设定秒数后，只删除第二个 `<thinking` 起到当前消息末尾的内容。
 5. 如果开启自动续写，删除后再等待设定秒数，然后触发继续。
-6. 每一楼最多自动截断一次、自动续写一次；截断后会忽略同楼残留的 `<thinking>` 痕迹，避免误删续写内容和循环烧钱。
+6. 每一楼最多自动截断一次、自动续写一次；截断后会把同聊天同楼层写入保险丝，手动续写、DOM 重绘或脚本重载后也不会再次删除。
 
 ## 发布方式
 
 1. 创建公开 GitHub 仓库，例如 `juxingmaomi/remove-double-thinking-chain`。
 2. 上传 `index.js` 到仓库根目录。
-3. 创建 tag / release：`v0.0.4`。
+3. 创建 tag / release：`v0.0.5`。
 4. 在 TavernHelper 中粘贴 `tavern-helper-loader.template.js` 的内容。
 5. 以后发布新版本后，只需要把 loader 里的 `VERSION` 改成新 tag，例如 `v0.0.2`。
 
@@ -37,7 +38,7 @@ TavernHelper / SillyTavern 小插件。它会在当前回复的 `</content>` 已
 ```js
 (async () => {
   const REPO = 'juxingmaomi/remove-double-thinking-chain';
-  const VERSION = 'v0.0.4';
+  const VERSION = 'v0.0.5';
   const URL = `https://gcore.jsdelivr.net/gh/${REPO}@${VERSION}/index.js`;
 
   const loaderState = {
@@ -86,7 +87,7 @@ TavernHelper / SillyTavern 小插件。它会在当前回复的 `</content>` 已
 当前固定版本入口：
 
 ```js
-https://gcore.jsdelivr.net/gh/juxingmaomi/remove-double-thinking-chain@v0.0.4/index.js
+https://gcore.jsdelivr.net/gh/juxingmaomi/remove-double-thinking-chain@v0.0.5/index.js
 ```
 
 如果仓库名不同，修改 loader 里的 `REPO` 即可。
