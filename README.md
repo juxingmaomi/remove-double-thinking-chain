@@ -20,13 +20,13 @@ TavernHelper / SillyTavern 小插件。它会在当前回复的 `</content>` 已
 3. 警戒状态下发现新的 `<thinking` 开头，立即尝试停止生成。
 4. 如果开启自动截断，等待设定秒数后，只删除第二个 `<thinking` 起到当前消息末尾的内容。
 5. 如果开启自动续写，删除后再等待设定秒数，然后触发继续。
-6. 每一楼最多自动续写一次，避免循环烧钱。
+6. 每一楼最多自动截断一次、自动续写一次，避免误删续写内容和循环烧钱。
 
 ## 发布方式
 
 1. 创建公开 GitHub 仓库，例如 `juxingmaomi/remove-double-thinking-chain`。
 2. 上传 `index.js` 到仓库根目录。
-3. 创建 tag / release：`v0.0.2`。
+3. 创建 tag / release：`v0.0.3`。
 4. 在 TavernHelper 中粘贴 `tavern-helper-loader.template.js` 的内容。
 5. 以后发布新版本后，只需要把 loader 里的 `VERSION` 改成新 tag，例如 `v0.0.2`。
 
@@ -37,7 +37,7 @@ TavernHelper / SillyTavern 小插件。它会在当前回复的 `</content>` 已
 ```js
 (async () => {
   const REPO = 'juxingmaomi/remove-double-thinking-chain';
-  const VERSION = 'v0.0.2';
+  const VERSION = 'v0.0.3';
   const URL = `https://gcore.jsdelivr.net/gh/${REPO}@${VERSION}/index.js`;
 
   const loaderState = {
@@ -86,7 +86,7 @@ TavernHelper / SillyTavern 小插件。它会在当前回复的 `</content>` 已
 当前固定版本入口：
 
 ```js
-https://gcore.jsdelivr.net/gh/juxingmaomi/remove-double-thinking-chain@v0.0.2/index.js
+https://gcore.jsdelivr.net/gh/juxingmaomi/remove-double-thinking-chain@v0.0.3/index.js
 ```
 
 如果仓库名不同，修改 loader 里的 `REPO` 即可。

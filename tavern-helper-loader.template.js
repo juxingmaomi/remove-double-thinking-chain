@@ -1,6 +1,6 @@
 (async () => {
   const REPO = 'juxingmaomi/remove-double-thinking-chain';
-  const VERSION = 'v0.0.2';
+  const VERSION = 'v0.0.3';
   const URL = `https://gcore.jsdelivr.net/gh/${REPO}@${VERSION}/index.js`;
 
   const loaderState = {

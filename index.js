@@ -1,14 +1,14 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.2
+// version: v0.0.3
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.2';
+  const SCRIPT_VERSION = 'v0.0.3';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -1300,6 +1300,14 @@
       });
       return;
     }
+    if (state.autoTruncateUsed) {
+      updateLog(logId, {
+        truncateStatus: '本楼已自动截断过一次，为避免误删续写内容，跳过再次截断',
+        continueStatus: '跳过再次截断，因此不自动续写',
+      });
+      setGuardStatus(`${floor.floorLabel} 已自动截断过一次；本次只停止，不再自动删除。`, 'warning');
+      return;
+    }
     const task = createTask(message, state, detection, floor, logId, settings);
     const delayMs = task.stopDelaySeconds * 1000;
     updateLog(logId, { truncateStatus: `等待 ${task.stopDelaySeconds} 秒后截断` });
@@ -1349,6 +1357,7 @@
     await saveChatSafely(writable.context);
     if (state) {
       state.truncated = true;
+      state.autoTruncateUsed = true;
       state.lastLength = truncated.length;
       state.contentClosed = true;
     }
@@ -1587,6 +1596,7 @@
       contentClosed: detection.hasContentClose,
       stopped: false,
       autoContinueUsed: false,
+      autoTruncateUsed: false,
       createdAt: Date.now(),
     });
   }
@@ -1651,6 +1661,7 @@
           contentClosed: detection.hasContentClose,
           stopped: false,
           autoContinueUsed: state && state.autoContinueUsed || false,
+          autoTruncateUsed: state && state.autoTruncateUsed || false,
           createdAt: state && state.createdAt || Date.now(),
           baselineOnly: true,
         });
@@ -1664,6 +1675,7 @@
           contentClosed: detection.hasContentClose,
           stopped: false,
           autoContinueUsed: false,
+          autoTruncateUsed: false,
           createdAt: Date.now(),
           baselineOnly: false,
         };
