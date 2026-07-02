@@ -1,14 +1,14 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.1
+// version: v0.0.2
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.1';
+  const SCRIPT_VERSION = 'v0.0.2';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -22,6 +22,10 @@
 
   const DEFAULT_SETTINGS = {
     enabled: true,
+    autoTruncate: false,
+    autoContinue: false,
+    stopDelaySeconds: 30,
+    continueDelaySeconds: 30,
   };
 
   let floatingButtonPosition = null;
@@ -32,6 +36,7 @@
   let outputPollTimer = null;
   let outputBindTimer = null;
   let bootRetryTimer = null;
+  let actionTimers = [];
   let stoppingInstance = false;
 
   const runtime = {
@@ -42,6 +47,7 @@
     nextWeakId: 1,
     observedTarget: null,
     checking: false,
+    activeTasks: new Map(),
   };
 
   function getHostWindow() {
@@ -85,6 +91,9 @@
       clearTimeout(bootRetryTimer);
       bootRetryTimer = null;
     }
+    actionTimers.forEach((timer) => clearTimeout(timer));
+    actionTimers = [];
+    runtime.activeTasks.clear();
   }
 
   function disconnectObservers() {
@@ -211,16 +220,33 @@
     return textarea.value;
   }
 
+  function normalizeDelaySeconds(value, fallback) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return fallback;
+    return Math.min(300, Math.max(0, Math.round(number)));
+  }
+
+  function normalizeSettings(settings) {
+    const merged = Object.assign({}, DEFAULT_SETTINGS, settings || {});
+    return {
+      enabled: merged.enabled !== false,
+      autoTruncate: merged.autoTruncate === true,
+      autoContinue: merged.autoContinue === true,
+      stopDelaySeconds: normalizeDelaySeconds(merged.stopDelaySeconds, DEFAULT_SETTINGS.stopDelaySeconds),
+      continueDelaySeconds: normalizeDelaySeconds(merged.continueDelaySeconds, DEFAULT_SETTINGS.continueDelaySeconds),
+    };
+  }
+
   function loadSettings() {
     try {
-      return Object.assign({}, DEFAULT_SETTINGS, JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'));
+      return normalizeSettings(JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'));
     } catch (error) {
-      return Object.assign({}, DEFAULT_SETTINGS);
+      return normalizeSettings(DEFAULT_SETTINGS);
     }
   }
 
   function saveSettings(settings) {
-    const next = Object.assign({}, DEFAULT_SETTINGS, loadSettings(), settings || {});
+    const next = normalizeSettings(Object.assign({}, loadSettings(), settings || {}));
     localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
     return next;
   }
@@ -240,10 +266,22 @@
 
   function addLog(entry) {
     const logs = loadLogs();
-    logs.unshift(Object.assign({
+    const nextEntry = Object.assign({
       id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       time: new Date().toISOString(),
-    }, entry || {}));
+    }, entry || {});
+    logs.unshift(nextEntry);
+    saveLogs(logs);
+    renderPanel();
+    return nextEntry.id;
+  }
+
+  function updateLog(id, patch) {
+    if (!id) return;
+    const logs = loadLogs();
+    const index = logs.findIndex((log) => log && log.id === id);
+    if (index < 0) return;
+    logs[index] = Object.assign({}, logs[index], patch || {});
     saveLogs(logs);
     renderPanel();
   }
@@ -465,6 +503,29 @@
         font-size: 12px;
         line-height: 1.5;
       }
+      .th-rdt-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 10px;
+        margin-top: 10px;
+      }
+      .th-rdt-field {
+        display: grid;
+        gap: 5px;
+        color: #aeb9b3;
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .th-rdt-input {
+        width: 100%;
+        min-height: 34px;
+        border: 1px solid rgba(130, 150, 165, 0.32);
+        border-radius: 8px;
+        background: #0f151c;
+        color: #eef3ef;
+        padding: 6px 8px;
+        font: inherit;
+      }
       .th-rdt-status {
         margin-top: 8px;
         padding: 8px 10px;
@@ -600,6 +661,12 @@
         }
         .th-rdt-btn {
           min-height: 38px;
+        }
+        .th-rdt-grid {
+          grid-template-columns: minmax(0, 1fr);
+        }
+        .th-rdt-input {
+          min-height: 40px;
         }
         .th-rdt-log-list {
           max-height: none;
@@ -819,6 +886,8 @@
         </div>
         <div class="th-rdt-log-snippet">前 10 字：${escapeHtml(log.snippet || '（空）')}</div>
         <div class="th-rdt-log-method">停止方式：${escapeHtml(log.stopMethod || log.stopError || '已尝试停止')}</div>
+        <div class="th-rdt-log-method">截断：${escapeHtml(log.truncateMethod || log.truncateError || log.truncateStatus || '未执行')}</div>
+        <div class="th-rdt-log-method">续写：${escapeHtml(log.continueMethod || log.continueError || log.continueStatus || '未执行')}</div>
       </div>
     `).join('');
   }
@@ -849,6 +918,34 @@
           <div class="th-rdt-status" data-guard-status data-type="${escapeHtml(statusType)}">${escapeHtml(status)}</div>
         </section>
         <section class="th-rdt-card">
+          <div class="th-rdt-section-title">谨慎自动处理</div>
+          <div class="th-rdt-hint">默认只停止。开启后会按顺序：停止 → 等待 → 删除第二个 &lt;thinking&gt; 起的内容 → 等待 → 续写。</div>
+          <div class="th-rdt-row" style="margin-top:10px;">
+            <label class="th-rdt-switch">
+              <input type="checkbox" data-field="autoTruncate"${settings.autoTruncate ? ' checked' : ''}>
+              <span class="th-rdt-switch-track" aria-hidden="true"></span>
+              <span>${settings.autoTruncate ? '自动截断已开启' : '自动截断已关闭'}</span>
+            </label>
+          </div>
+          <div class="th-rdt-row" style="margin-top:10px;">
+            <label class="th-rdt-switch">
+              <input type="checkbox" data-field="autoContinue"${settings.autoContinue ? ' checked' : ''}>
+              <span class="th-rdt-switch-track" aria-hidden="true"></span>
+              <span>${settings.autoContinue ? '截断后自动续写已开启' : '截断后自动续写已关闭'}</span>
+            </label>
+          </div>
+          <div class="th-rdt-grid">
+            <label class="th-rdt-field">
+              <span>停止后等待秒数</span>
+              <input class="th-rdt-input" type="number" min="0" max="300" step="1" data-field="stopDelaySeconds" value="${escapeHtml(settings.stopDelaySeconds)}">
+            </label>
+            <label class="th-rdt-field">
+              <span>删除后等待秒数</span>
+              <input class="th-rdt-input" type="number" min="0" max="300" step="1" data-field="continueDelaySeconds" value="${escapeHtml(settings.continueDelaySeconds)}">
+            </label>
+          </div>
+        </section>
+        <section class="th-rdt-card">
           <div class="th-rdt-section-head">
             <div class="th-rdt-section-title">停止日志</div>
             <button type="button" class="th-rdt-btn danger" data-action="clear-logs">清空日志</button>
@@ -876,13 +973,22 @@
     });
     panel.addEventListener('change', (event) => {
       const field = event.target && event.target.dataset ? event.target.dataset.field : '';
-      if (field !== 'enabled') return;
-      const enabled = Boolean(event.target.checked);
-      saveSettings({ enabled });
+      if (!field) return;
+      const patch = {};
+      if (['enabled', 'autoTruncate', 'autoContinue'].includes(field)) {
+        patch[field] = Boolean(event.target.checked);
+      } else if (['stopDelaySeconds', 'continueDelaySeconds'].includes(field)) {
+        patch[field] = normalizeDelaySeconds(event.target.value, DEFAULT_SETTINGS[field]);
+      } else {
+        return;
+      }
+      const settings = saveSettings(patch);
       syncFloatingButtonState(getHostDocument().getElementById(FLOATING_BUTTON_ID));
-      runtime.states.clear();
-      primeCurrentMessageBaseline();
-      setGuardStatus(enabled ? '守护已开启，已从当前最新消息建立基线。' : '守护已关闭，浮窗仍会常驻。', enabled ? 'muted' : 'warning');
+      if (field === 'enabled') {
+        runtime.states.clear();
+        primeCurrentMessageBaseline();
+      }
+      setGuardStatus(settings.enabled ? '设置已保存，守护正在按当前配置工作。' : '守护已关闭，浮窗仍会常驻。', settings.enabled ? 'muted' : 'warning');
       renderPanel();
     });
   }
@@ -1031,6 +1137,268 @@
       return { ok: true, method: `点击 ${control.id ? `#${control.id}` : '停止按钮'}` };
     }
     return { ok: false, error: '未找到停止生成入口' };
+  }
+
+  function scheduleAction(callback, delayMs) {
+    const timer = setTimeout(() => {
+      actionTimers = actionTimers.filter((item) => item !== timer);
+      callback();
+    }, Math.max(0, delayMs));
+    actionTimers.push(timer);
+    return timer;
+  }
+
+  function getNumericMessageId(message) {
+    const node = message && message.node;
+    if (!node) return null;
+    const rawMesid = node.getAttribute('mesid') || node.dataset && (node.dataset.mesid || node.dataset.messageId);
+    const numericMesid = Number(rawMesid);
+    return Number.isFinite(numericMesid) ? numericMesid : null;
+  }
+
+  function getWritableMessageRecord(message) {
+    const context = getTavernContext();
+    const index = getNumericMessageId(message);
+    if (!context || !Array.isArray(context.chat) || !Number.isFinite(index)) {
+      return { ok: false, error: '无法定位酒馆内部消息数据' };
+    }
+    const record = context.chat[index];
+    if (!record) {
+      return { ok: false, error: `无法读取第 ${index + 1} 楼消息数据` };
+    }
+    if (typeof context.updateMessageBlock !== 'function') {
+      return { ok: false, error: '酒馆未暴露 updateMessageBlock，已取消自动截断' };
+    }
+    return { ok: true, context, index, record };
+  }
+
+  function getRecordText(record) {
+    if (!record) return '';
+    const swipeIndex = Number(record.swipe_id);
+    if (Array.isArray(record.swipes) && Number.isFinite(swipeIndex) && typeof record.swipes[swipeIndex] === 'string') {
+      return record.swipes[swipeIndex];
+    }
+    return String(record.mes || '');
+  }
+
+  function detectDoubleThinkingInText(value) {
+    const text = String(value || '');
+    const contentClose = findTag(text, 'content', 0, true);
+    if (!contentClose) {
+      return { hasContentClose: false, trigger: false };
+    }
+    const thinking = findTag(text, 'thinking', contentClose.index + contentClose.length, false);
+    if (!thinking) {
+      return { hasContentClose: true, trigger: false };
+    }
+    return {
+      hasContentClose: true,
+      trigger: true,
+      thinkingIndex: thinking.index,
+      snippet: getSnippetBefore(text, thinking.index),
+    };
+  }
+
+  function applyRecordText(record, text) {
+    const value = String(text || '');
+    const swipeIndex = Number(record.swipe_id);
+    record.mes = value;
+    if (Array.isArray(record.swipes) && Number.isFinite(swipeIndex) && typeof record.swipes[swipeIndex] === 'string') {
+      record.swipes[swipeIndex] = value;
+    }
+    if (record.extra && typeof record.extra.display_text === 'string') {
+      const displayDetection = detectDoubleThinkingInText(record.extra.display_text);
+      if (displayDetection.trigger) {
+        record.extra.display_text = record.extra.display_text.slice(0, displayDetection.thinkingIndex);
+      }
+    }
+  }
+
+  async function saveChatSafely(context) {
+    if (!context || typeof context.saveChat !== 'function') return;
+    try {
+      await Promise.resolve(context.saveChat());
+    } catch (error) {
+      console.warn(`[${SCRIPT_NAME}] 保存聊天失败`, error);
+    }
+  }
+
+  function refreshMessageBlock(info) {
+    info.context.updateMessageBlock(info.index, info.record);
+  }
+
+  function findContinueControl() {
+    const doc = getHostDocument();
+    const selectors = [
+      '#mes_continue',
+      'button[title*="Continue"]',
+      'button[title*="继续"]',
+      'button[aria-label*="Continue"]',
+      'button[aria-label*="继续"]',
+      '[data-action="continue"]',
+    ];
+    for (const selector of selectors) {
+      const node = doc.querySelector(selector);
+      if (node && isElementVisible(node) && !node.disabled) return node;
+    }
+    return null;
+  }
+
+  function continueCurrentGeneration() {
+    if (isGenerationActive() === true) {
+      return { ok: false, error: '当前仍在生成，已取消自动续写' };
+    }
+    const control = findContinueControl();
+    if (control) {
+      clickStopControl(control);
+      return { ok: true, method: `点击 ${control.id ? `#${control.id}` : '继续按钮'}` };
+    }
+    const context = getTavernContext();
+    if (context && typeof context.generate === 'function') {
+      try {
+        const result = context.generate('continue');
+        if (result && typeof result.catch === 'function') {
+          result.catch((error) => console.warn(`[${SCRIPT_NAME}] 自动续写失败`, error));
+        }
+        return { ok: true, method: 'generate("continue")' };
+      } catch (error) {
+        return { ok: false, error: error.message || String(error) };
+      }
+    }
+    return { ok: false, error: '未找到继续生成入口' };
+  }
+
+  function createTask(message, state, detection, floor, logId, settings) {
+    const task = {
+      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      key: getMessageKey(message),
+      rawMesid: floor.rawMesid || '',
+      floorLabel: floor.floorLabel,
+      logId,
+      snippet: detection.snippet || '',
+      stopDelaySeconds: settings.stopDelaySeconds,
+      continueDelaySeconds: settings.continueDelaySeconds,
+      autoContinue: settings.autoContinue && !state.autoContinueUsed,
+    };
+    runtime.activeTasks.set(task.id, task);
+    state.activeTaskId = task.id;
+    return task;
+  }
+
+  function cancelTask(task, reason) {
+    if (!task) return;
+    runtime.activeTasks.delete(task.id);
+    updateLog(task.logId, { truncateError: reason });
+    setGuardStatus(reason, 'warning');
+  }
+
+  function schedulePostStopProcessing(message, state, detection, floor, logId, settings) {
+    if (!settings.autoTruncate) {
+      updateLog(logId, {
+        truncateStatus: '未开启自动截断',
+        continueStatus: '未开启自动截断，跳过续写',
+      });
+      return;
+    }
+    const task = createTask(message, state, detection, floor, logId, settings);
+    const delayMs = task.stopDelaySeconds * 1000;
+    updateLog(logId, { truncateStatus: `等待 ${task.stopDelaySeconds} 秒后截断` });
+    setGuardStatus(`已停止 ${floor.floorLabel}；等待 ${task.stopDelaySeconds} 秒后删除第二个 <thinking> 起的内容。`, 'warning');
+    scheduleAction(() => {
+      runTruncateTask(task).catch((error) => {
+        console.warn(`[${SCRIPT_NAME}] 自动截断失败`, error);
+        cancelTask(task, `自动截断失败：${error.message || error}`);
+      });
+    }, delayMs);
+  }
+
+  async function runTruncateTask(task) {
+    if (!runtime.activeTasks.has(task.id)) return;
+    const state = runtime.states.get(task.key);
+    const latest = getLatestAssistantMessage();
+    if (!latest || getMessageKey(latest) !== task.key) {
+      cancelTask(task, '当前最后一楼已变化，取消自动截断');
+      return;
+    }
+    if (isGenerationActive() === true) {
+      cancelTask(task, '等待后仍处于生成中，取消自动截断');
+      return;
+    }
+    const writable = getWritableMessageRecord(latest);
+    if (!writable.ok) {
+      cancelTask(task, writable.error);
+      return;
+    }
+    if (task.rawMesid && String(writable.index) !== String(task.rawMesid)) {
+      cancelTask(task, '消息楼层编号变化，取消自动截断');
+      return;
+    }
+    const rawText = getRecordText(writable.record);
+    const detection = detectDoubleThinkingInText(rawText);
+    if (!detection.trigger) {
+      cancelTask(task, '保存数据中未找到第二个 <thinking>，取消自动截断');
+      return;
+    }
+    const truncated = rawText.slice(0, detection.thinkingIndex);
+    if (truncated === rawText) {
+      cancelTask(task, '截断点无效，取消自动截断');
+      return;
+    }
+    applyRecordText(writable.record, truncated);
+    refreshMessageBlock(writable);
+    await saveChatSafely(writable.context);
+    if (state) {
+      state.truncated = true;
+      state.lastLength = truncated.length;
+      state.contentClosed = true;
+    }
+    const removedCount = rawText.length - truncated.length;
+    updateLog(task.logId, {
+      snippet: detection.snippet || task.snippet,
+      truncateMethod: `已删除 ${removedCount} 字符`,
+      truncateError: '',
+      truncatedAt: new Date().toISOString(),
+    });
+    setGuardStatus(`已精确删除 ${task.floorLabel} 第二个 <thinking> 起的 ${removedCount} 个字符。`, 'warning');
+
+    if (task.autoContinue) {
+      updateLog(task.logId, { continueStatus: `等待 ${task.continueDelaySeconds} 秒后续写` });
+      scheduleAction(() => runContinueTask(task), task.continueDelaySeconds * 1000);
+    } else {
+      updateLog(task.logId, { continueStatus: '未开启自动续写，或本楼已自动续写过一次' });
+      runtime.activeTasks.delete(task.id);
+    }
+  }
+
+  function runContinueTask(task) {
+    if (!runtime.activeTasks.has(task.id)) return;
+    const state = runtime.states.get(task.key);
+    const latest = getLatestAssistantMessage();
+    if (!latest || getMessageKey(latest) !== task.key) {
+      updateLog(task.logId, { continueError: '当前最后一楼已变化，取消自动续写' });
+      setGuardStatus('当前最后一楼已变化，取消自动续写。', 'warning');
+      runtime.activeTasks.delete(task.id);
+      return;
+    }
+    const result = continueCurrentGeneration();
+    if (result.ok) {
+      if (state) {
+        state.stopped = false;
+        state.autoContinueUsed = true;
+        state.lastLength = getMaxSourceLength(getMessageSources(latest));
+        state.contentClosed = true;
+      }
+      updateLog(task.logId, {
+        continueMethod: result.method,
+        continueStatus: '',
+        continuedAt: new Date().toISOString(),
+      });
+      setGuardStatus(`已为 ${task.floorLabel} 触发自动续写；本楼不会再次自动续写。`, 'warning');
+    } else {
+      updateLog(task.logId, { continueError: result.error });
+      setGuardStatus(`自动续写失败：${result.error}`, 'error');
+    }
+    runtime.activeTasks.delete(task.id);
   }
 
   function getChatContainer() {
@@ -1218,6 +1586,7 @@
       lastLength: getMaxSourceLength(sources),
       contentClosed: detection.hasContentClose,
       stopped: false,
+      autoContinueUsed: false,
       createdAt: Date.now(),
     });
   }
@@ -1226,6 +1595,7 @@
     state.stopped = true;
     const floor = getFloorInfo(message);
     const stopResult = stopCurrentGeneration();
+    const settings = loadSettings();
     const entry = {
       floorLabel: floor.floorLabel,
       floorNumber: floor.floorNumber,
@@ -1234,13 +1604,18 @@
       sourceKind: detection.sourceKind || '',
       stopMethod: stopResult.ok ? stopResult.method : '',
       stopError: stopResult.ok ? '' : stopResult.error,
+      truncateStatus: stopResult.ok && settings.autoTruncate ? `等待 ${settings.stopDelaySeconds} 秒后截断` : '未开启自动截断',
+      continueStatus: settings.autoContinue ? `截断后等待 ${settings.continueDelaySeconds} 秒续写` : '未开启自动续写',
     };
-    addLog(entry);
+    const logId = addLog(entry);
     const messageText = stopResult.ok
       ? `检测到 </content> 后的新 <thinking>，已停止：${floor.floorLabel}`
       : `检测到新 <thinking>，但未找到停止入口：${floor.floorLabel}`;
     setGuardStatus(messageText, stopResult.ok ? 'warning' : 'error');
     notify(stopResult.ok ? 'warning' : 'error', messageText);
+    if (stopResult.ok) {
+      schedulePostStopProcessing(message, state, detection, floor, logId, settings);
+    }
   }
 
   function inspectCurrentMessage(reason) {
@@ -1266,11 +1641,16 @@
       const detection = detectDoubleThinking(sources);
       let state = runtime.states.get(key);
 
+      if (state && state.activeTaskId && runtime.activeTasks.has(state.activeTaskId)) {
+        return;
+      }
+
       if (!generationActive) {
         runtime.states.set(key, {
           lastLength: maxLength,
           contentClosed: detection.hasContentClose,
           stopped: false,
+          autoContinueUsed: state && state.autoContinueUsed || false,
           createdAt: state && state.createdAt || Date.now(),
           baselineOnly: true,
         });
@@ -1283,15 +1663,19 @@
           lastLength: maxLength,
           contentClosed: detection.hasContentClose,
           stopped: false,
+          autoContinueUsed: false,
           createdAt: Date.now(),
           baselineOnly: false,
         };
+        runtime.states.set(key, state);
+        if (detection.trigger) {
+          handleTrigger(message, state, detection);
+          return;
+        }
         if (reason === 'baseline' || reason === 'poll') {
-          runtime.states.set(key, state);
           setGuardStatus('守护已开启，正在监听当前生成楼层。', 'muted');
           return;
         }
-        runtime.states.set(key, state);
         return;
       }
 
