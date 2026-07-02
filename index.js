@@ -1,14 +1,14 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.3
+// version: v0.0.4
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.3';
+  const SCRIPT_VERSION = 'v0.0.4';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -41,6 +41,7 @@
 
   const runtime = {
     states: new Map(),
+    autoTruncatedKeys: new Set(),
     lastStatus: '',
     lastStatusType: 'muted',
     weakIds: new WeakMap(),
@@ -1288,6 +1289,10 @@
   function cancelTask(task, reason) {
     if (!task) return;
     runtime.activeTasks.delete(task.id);
+    const state = runtime.states.get(task.key);
+    if (state && state.activeTaskId === task.id) {
+      state.activeTaskId = '';
+    }
     updateLog(task.logId, { truncateError: reason });
     setGuardStatus(reason, 'warning');
   }
@@ -1300,7 +1305,7 @@
       });
       return;
     }
-    if (state.autoTruncateUsed) {
+    if (hasAutoTruncated(message, state)) {
       updateLog(logId, {
         truncateStatus: '本楼已自动截断过一次，为避免误删续写内容，跳过再次截断',
         continueStatus: '跳过再次截断，因此不自动续写',
@@ -1341,6 +1346,10 @@
       cancelTask(task, '消息楼层编号变化，取消自动截断');
       return;
     }
+    if (hasAutoTruncated(latest, state, task, writable)) {
+      cancelTask(task, '本楼已经自动截断过一次，取消重复截断以保护续写内容');
+      return;
+    }
     const rawText = getRecordText(writable.record);
     const detection = detectDoubleThinkingInText(rawText);
     if (!detection.trigger) {
@@ -1353,6 +1362,7 @@
       return;
     }
     applyRecordText(writable.record, truncated);
+    markAutoTruncated(latest, task, writable);
     refreshMessageBlock(writable);
     await saveChatSafely(writable.context);
     if (state) {
@@ -1375,6 +1385,9 @@
       scheduleAction(() => runContinueTask(task), task.continueDelaySeconds * 1000);
     } else {
       updateLog(task.logId, { continueStatus: '未开启自动续写，或本楼已自动续写过一次' });
+      if (state && state.activeTaskId === task.id) {
+        state.activeTaskId = '';
+      }
       runtime.activeTasks.delete(task.id);
     }
   }
@@ -1386,6 +1399,9 @@
     if (!latest || getMessageKey(latest) !== task.key) {
       updateLog(task.logId, { continueError: '当前最后一楼已变化，取消自动续写' });
       setGuardStatus('当前最后一楼已变化，取消自动续写。', 'warning');
+      if (state && state.activeTaskId === task.id) {
+        state.activeTaskId = '';
+      }
       runtime.activeTasks.delete(task.id);
       return;
     }
@@ -1396,6 +1412,7 @@
         state.autoContinueUsed = true;
         state.lastLength = getMaxSourceLength(getMessageSources(latest));
         state.contentClosed = true;
+        state.activeTaskId = '';
       }
       updateLog(task.logId, {
         continueMethod: result.method,
@@ -1406,6 +1423,9 @@
     } else {
       updateLog(task.logId, { continueError: result.error });
       setGuardStatus(`自动续写失败：${result.error}`, 'error');
+    }
+    if (state && state.activeTaskId === task.id) {
+      state.activeTaskId = '';
     }
     runtime.activeTasks.delete(task.id);
   }
@@ -1469,6 +1489,42 @@
     const mesid = node.getAttribute('mesid') || node.dataset && (node.dataset.mesid || node.dataset.messageId);
     if (mesid != null && String(mesid).trim() !== '') return `mesid:${String(mesid).trim()}`;
     return `node:${getWeakNodeId(node)}`;
+  }
+
+  function getAutoTruncatedKeys(message, task, writable) {
+    const keys = new Set();
+    if (message) {
+      const key = getMessageKey(message);
+      if (key && key !== 'none') keys.add(key);
+      const index = getNumericMessageId(message);
+      if (Number.isFinite(index)) {
+        keys.add(`mesid:${index}`);
+        keys.add(`floor:${index + 1}`);
+      }
+    }
+    if (task) {
+      if (task.key) keys.add(task.key);
+      if (task.rawMesid != null && String(task.rawMesid).trim() !== '') {
+        const rawMesid = String(task.rawMesid).trim();
+        keys.add(`mesid:${rawMesid}`);
+        const numericMesid = Number(rawMesid);
+        if (Number.isFinite(numericMesid)) keys.add(`floor:${numericMesid + 1}`);
+      }
+    }
+    if (writable && Number.isFinite(writable.index)) {
+      keys.add(`mesid:${writable.index}`);
+      keys.add(`floor:${writable.index + 1}`);
+    }
+    return Array.from(keys);
+  }
+
+  function markAutoTruncated(message, task, writable) {
+    getAutoTruncatedKeys(message, task, writable).forEach((key) => runtime.autoTruncatedKeys.add(key));
+  }
+
+  function hasAutoTruncated(message, state, task, writable) {
+    if (state && state.autoTruncateUsed) return true;
+    return getAutoTruncatedKeys(message, task, writable).some((key) => runtime.autoTruncatedKeys.has(key));
   }
 
   function getFloorInfo(message) {
@@ -1650,6 +1706,7 @@
       const generationActive = isGenerationActive() === true;
       const detection = detectDoubleThinking(sources);
       let state = runtime.states.get(key);
+      const alreadyAutoTruncated = hasAutoTruncated(message, state);
 
       if (state && state.activeTaskId && runtime.activeTasks.has(state.activeTaskId)) {
         return;
@@ -1661,7 +1718,7 @@
           contentClosed: detection.hasContentClose,
           stopped: false,
           autoContinueUsed: state && state.autoContinueUsed || false,
-          autoTruncateUsed: state && state.autoTruncateUsed || false,
+          autoTruncateUsed: alreadyAutoTruncated,
           createdAt: state && state.createdAt || Date.now(),
           baselineOnly: true,
         });
@@ -1675,11 +1732,15 @@
           contentClosed: detection.hasContentClose,
           stopped: false,
           autoContinueUsed: false,
-          autoTruncateUsed: false,
+          autoTruncateUsed: alreadyAutoTruncated,
           createdAt: Date.now(),
           baselineOnly: false,
         };
         runtime.states.set(key, state);
+        if (detection.trigger && hasAutoTruncated(message, state)) {
+          setGuardStatus('本楼已经自动截断过一次，忽略后续同楼 <thinking> 痕迹，避免误删续写内容。', 'warning');
+          return;
+        }
         if (detection.trigger) {
           handleTrigger(message, state, detection);
           return;
@@ -1699,6 +1760,10 @@
         state.contentClosed = true;
         const floor = getFloorInfo(message);
         setGuardStatus(`已看到 ${floor.floorLabel} 的 </content>，开始警戒后续 <thinking>。`, 'muted');
+      }
+      if (detection.trigger && hasAutoTruncated(message, state)) {
+        setGuardStatus('本楼已经自动截断过一次，忽略后续同楼 <thinking> 痕迹，避免误删续写内容。', 'warning');
+        return;
       }
       if (detection.trigger) {
         handleTrigger(message, state, detection);
