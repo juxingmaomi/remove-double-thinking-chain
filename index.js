@@ -1,14 +1,14 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.6
+// version: v0.0.7
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.6';
+  const SCRIPT_VERSION = 'v0.0.7';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -1681,9 +1681,10 @@
   function getMessageKey(message) {
     const node = message && message.node;
     if (!node) return 'none';
+    const scope = getGuardScope();
     const mesid = node.getAttribute('mesid') || node.dataset && (node.dataset.mesid || node.dataset.messageId);
-    if (mesid != null && String(mesid).trim() !== '') return `mesid:${String(mesid).trim()}`;
-    return `node:${getWeakNodeId(node)}`;
+    if (mesid != null && String(mesid).trim() !== '') return `scope:${scope}::mesid:${String(mesid).trim()}`;
+    return `scope:${scope}::node:${getWeakNodeId(node)}`;
   }
 
   function normalizeGuardPart(value) {
@@ -1699,6 +1700,7 @@
       parts.push(`character:${normalizeGuardPart(context.characterId)}`);
       parts.push(`group:${normalizeGuardPart(context.groupId)}`);
       parts.push(`name:${normalizeGuardPart(context.name2)}`);
+      parts.push(`integrity:${normalizeGuardPart(context.chatMetadata && context.chatMetadata.integrity)}`);
     }
     try {
       parts.push(`path:${normalizeGuardPart(host.location && host.location.pathname)}`);
@@ -1772,7 +1774,7 @@
     const keys = getAutoTruncatedKeys(message, task, writable, detection);
     const persistentKeys = getPersistentGuardKeys(keys);
     const scopedKeys = getScopedGuardKeys(persistentKeys);
-    keys.concat(scopedKeys).forEach((key) => runtime.autoTruncatedKeys.add(key));
+    scopedKeys.forEach((key) => runtime.autoTruncatedKeys.add(key));
     saveTruncatedGuards(loadTruncatedGuards().concat(scopedKeys));
   }
 
@@ -1780,7 +1782,7 @@
     const keys = getAutoTruncatedKeys(message, task, writable, detection);
     const persistentKeys = getPersistentGuardKeys(keys);
     const scopedKeys = getScopedGuardKeys(persistentKeys);
-    keys.concat(scopedKeys).forEach((key) => runtime.handledKeys.add(key));
+    scopedKeys.forEach((key) => runtime.handledKeys.add(key));
     saveHandledGuards(loadHandledGuards().concat(scopedKeys));
   }
 
@@ -1789,7 +1791,7 @@
     const keys = getPersistentGuardKeys(getAutoTruncatedKeys(message, task, writable, detection));
     const scopedKeys = getScopedGuardKeys(keys);
     const savedKeys = new Set(loadHandledGuards());
-    return keys.concat(scopedKeys).some((key) => runtime.handledKeys.has(key) || savedKeys.has(key));
+    return scopedKeys.some((key) => runtime.handledKeys.has(key) || savedKeys.has(key));
   }
 
   function hasRecentTruncateLog(message, task, writable) {
@@ -1818,7 +1820,7 @@
     const keys = getPersistentGuardKeys(getAutoTruncatedKeys(message, task, writable, detection));
     const scopedKeys = getScopedGuardKeys(keys);
     const savedKeys = new Set(loadTruncatedGuards());
-    return keys.concat(scopedKeys).some((key) => runtime.autoTruncatedKeys.has(key) || savedKeys.has(key));
+    return scopedKeys.some((key) => runtime.autoTruncatedKeys.has(key) || savedKeys.has(key));
   }
 
   function getFloorInfo(message) {
