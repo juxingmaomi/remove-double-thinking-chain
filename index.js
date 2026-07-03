@@ -1,14 +1,14 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.8
+// version: v0.0.9
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.8';
+  const SCRIPT_VERSION = 'v0.0.9';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -25,13 +25,16 @@
   const MAX_LOGS = 80;
   const MAX_BACKUP_DAYS = 14;
   const ABNORMAL_THINKING_OBSERVE_LIMIT = 500;
+  const COMPLETION_CLEANUP_MAX_BLOCK_LENGTH = 2000;
 
   const DEFAULT_SETTINGS = {
     enabled: true,
     autoTruncate: false,
     autoContinue: false,
+    cleanupContinuationThinking: true,
     stopDelaySeconds: 30,
     continueDelaySeconds: 30,
+    cleanupDelaySeconds: 5,
   };
 
   let floatingButtonPosition = null;
@@ -240,8 +243,10 @@
       enabled: merged.enabled !== false,
       autoTruncate: merged.autoTruncate === true,
       autoContinue: merged.autoContinue === true,
+      cleanupContinuationThinking: merged.cleanupContinuationThinking !== false,
       stopDelaySeconds: normalizeDelaySeconds(merged.stopDelaySeconds, DEFAULT_SETTINGS.stopDelaySeconds),
       continueDelaySeconds: normalizeDelaySeconds(merged.continueDelaySeconds, DEFAULT_SETTINGS.continueDelaySeconds),
+      cleanupDelaySeconds: normalizeDelaySeconds(merged.cleanupDelaySeconds, DEFAULT_SETTINGS.cleanupDelaySeconds),
     };
   }
 
@@ -1094,6 +1099,13 @@
               <span>${settings.autoContinue ? '截断后自动续写已开启' : '截断后自动续写已关闭'}</span>
             </label>
           </div>
+          <div class="th-rdt-row" style="margin-top:10px;">
+            <label class="th-rdt-switch">
+              <input type="checkbox" data-field="cleanupContinuationThinking"${settings.cleanupContinuationThinking ? ' checked' : ''}>
+              <span class="th-rdt-switch-track" aria-hidden="true"></span>
+              <span>${settings.cleanupContinuationThinking ? '收笔后清理续写 thinking 已开启' : '收笔后清理续写 thinking 已关闭'}</span>
+            </label>
+          </div>
           <div class="th-rdt-grid">
             <label class="th-rdt-field">
               <span>停止后等待秒数</span>
@@ -1102,6 +1114,10 @@
             <label class="th-rdt-field">
               <span>删除后等待秒数</span>
               <input class="th-rdt-input" type="number" min="0" max="300" step="1" data-field="continueDelaySeconds" value="${escapeHtml(settings.continueDelaySeconds)}">
+            </label>
+            <label class="th-rdt-field">
+              <span>收笔后清理等待秒数</span>
+              <input class="th-rdt-input" type="number" min="0" max="300" step="1" data-field="cleanupDelaySeconds" value="${escapeHtml(settings.cleanupDelaySeconds)}">
             </label>
           </div>
         </section>
@@ -1140,9 +1156,9 @@
       const field = event.target && event.target.dataset ? event.target.dataset.field : '';
       if (!field) return;
       const patch = {};
-      if (['enabled', 'autoTruncate', 'autoContinue'].includes(field)) {
+      if (['enabled', 'autoTruncate', 'autoContinue', 'cleanupContinuationThinking'].includes(field)) {
         patch[field] = Boolean(event.target.checked);
-      } else if (['stopDelaySeconds', 'continueDelaySeconds'].includes(field)) {
+      } else if (['stopDelaySeconds', 'continueDelaySeconds', 'cleanupDelaySeconds'].includes(field)) {
         patch[field] = normalizeDelaySeconds(event.target.value, DEFAULT_SETTINGS[field]);
       } else {
         return;
@@ -1637,6 +1653,94 @@
     runtime.activeTasks.delete(task.id);
   }
 
+  function scheduleCompletionCleanup(message, state, settings) {
+    if (!settings.cleanupContinuationThinking || !message || !state || state.cleanupDone || state.cleanupScheduled) return;
+    const key = getMessageKey(message);
+    const writable = getWritableMessageRecord(message);
+    if (!writable.ok) return;
+    const rawText = getRecordText(writable.record);
+    if (!hasCompletionMarker(rawText)) return;
+    const ranges = findContinuationThinkingCleanupRanges(rawText);
+    if (!ranges.length) {
+      state.cleanupDone = true;
+      return;
+    }
+    state.cleanupScheduled = true;
+    setGuardStatus(`检测到此处收笔，等待 ${settings.cleanupDelaySeconds} 秒后清理续写 thinking。`, 'muted');
+    scheduleAction(() => {
+      runCompletionCleanupTask({
+        key,
+        rawMesid: String(writable.index),
+        floorLabel: getFloorInfo(message).floorLabel,
+        cleanupDelaySeconds: settings.cleanupDelaySeconds,
+      }).catch((error) => {
+        const currentState = runtime.states.get(key);
+        if (currentState) currentState.cleanupScheduled = false;
+        console.warn(`[${SCRIPT_NAME}] 清理续写 thinking 失败`, error);
+        setGuardStatus(`清理续写 thinking 失败：${error.message || error}`, 'error');
+      });
+    }, settings.cleanupDelaySeconds * 1000);
+  }
+
+  async function runCompletionCleanupTask(task) {
+    const state = runtime.states.get(task.key);
+    if (state) state.cleanupScheduled = false;
+    if (isGenerationActive() === true) return;
+    const latest = getLatestAssistantMessage();
+    if (!latest || getMessageKey(latest) !== task.key) return;
+    const writable = getWritableMessageRecord(latest);
+    if (!writable.ok) return;
+    if (task.rawMesid && String(writable.index) !== String(task.rawMesid)) return;
+    const rawText = getRecordText(writable.record);
+    if (!hasCompletionMarker(rawText)) return;
+    const ranges = findContinuationThinkingCleanupRanges(rawText);
+    if (!ranges.length) {
+      if (state) state.cleanupDone = true;
+      return;
+    }
+    const removedText = ranges.map((range, index) => `#${index + 1}\n${range.text}`).join('\n\n---\n\n');
+    const backupResult = saveDeletedBackup({
+      floorLabel: task.floorLabel,
+      floorNumber: Number.isFinite(writable.index) ? writable.index + 1 : null,
+      rawMesid: String(writable.index),
+      snippet: ranges[0].snippet || '',
+      removedCount: removedText.length,
+      text: removedText,
+      reason: 'completion-cleanup',
+    });
+    if (!backupResult.ok) {
+      setGuardStatus(`保存续写 thinking 备份失败，已取消清理：${backupResult.error}`, 'error');
+      return;
+    }
+    let cleaned = rawText;
+    ranges.slice().reverse().forEach((range) => {
+      cleaned = cleaned.slice(0, range.start) + cleaned.slice(range.end);
+    });
+    if (cleaned === rawText) return;
+    applyRecordText(writable.record, cleaned);
+    await refreshMessageBlock(writable);
+    await saveChatSafely(writable.context);
+    if (getRecordText(writable.record) !== cleaned) {
+      setGuardStatus('清理后读回内容不一致，未记录为成功。', 'warning');
+      return;
+    }
+    if (state) {
+      state.cleanupDone = true;
+      state.lastLength = cleaned.length;
+    }
+    addLog({
+      floorLabel: task.floorLabel,
+      floorNumber: Number.isFinite(writable.index) ? writable.index + 1 : null,
+      rawMesid: String(writable.index),
+      snippet: ranges[0].snippet || '',
+      stopMethod: '生成完成后清理',
+      truncateMethod: `已清理 ${ranges.length} 段续写 thinking，共 ${removedText.length} 字符`,
+      backupDate: backupResult.dateKey,
+      classificationReason: '此处收笔后清理完整闭合续写 thinking',
+    });
+    setGuardStatus(`已在收笔后清理 ${task.floorLabel} 的 ${ranges.length} 段续写 thinking。`, 'warning');
+  }
+
   function getChatContainer() {
     const doc = getHostDocument();
     return doc.getElementById('chat')
@@ -1972,6 +2076,43 @@
     };
   }
 
+  function hasCompletionMarker(text) {
+    const normalized = normalizeTagSource(text);
+    const tail = normalized.slice(Math.max(0, normalized.length - 3000));
+    return /此处\s*收笔/.test(tail);
+  }
+
+  function findContinuationThinkingCleanupRanges(text) {
+    const source = String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '');
+    const contentClose = findTag(source, 'content', 0, true);
+    if (!contentClose || !hasCompletionMarker(source)) return [];
+    const ranges = [];
+    let searchIndex = contentClose.index + contentClose.length;
+    while (searchIndex < source.length) {
+      const thinking = findTag(source, 'thinking', searchIndex, false);
+      if (!thinking) break;
+      const classification = classifyThinkingBlock(source, thinking);
+      if (classification.kind === 'abnormal') {
+        searchIndex = thinking.index + thinking.length;
+        continue;
+      }
+      const close = findTag(source, 'thinking', thinking.index + thinking.length, true);
+      if (!close) break;
+      const endIndex = close.index + close.length;
+      const blockLength = endIndex - thinking.index;
+      if (blockLength > 0 && blockLength <= COMPLETION_CLEANUP_MAX_BLOCK_LENGTH) {
+        ranges.push({
+          start: thinking.index,
+          end: endIndex,
+          text: source.slice(thinking.index, endIndex),
+          snippet: getSnippetBefore(source, thinking.index),
+        });
+      }
+      searchIndex = endIndex;
+    }
+    return ranges;
+  }
+
   function getSnippetBefore(source, index) {
     const before = normalizeTagSource(source).slice(Math.max(0, index - 500), index);
     const readable = stripTagsForSnippet(before);
@@ -2035,6 +2176,9 @@
       autoContinueUsed: false,
       autoTruncateUsed: false,
       handled: hasHandled(message),
+      seenGenerating: false,
+      cleanupDone: false,
+      cleanupScheduled: false,
       createdAt: Date.now(),
     });
   }
@@ -2105,16 +2249,21 @@
       const alreadyHandled = hasHandled(message, state, null, null, detection);
 
       if (!generationActive) {
-        runtime.states.set(key, {
+        const nextState = {
           lastLength: maxLength,
           contentClosed: detection.hasContentClose,
           stopped: false,
           autoContinueUsed: state && state.autoContinueUsed || false,
           autoTruncateUsed: alreadyAutoTruncated,
           handled: alreadyHandled,
+          seenGenerating: state && state.seenGenerating || false,
+          cleanupDone: state && state.cleanupDone || false,
+          cleanupScheduled: state && state.cleanupScheduled || false,
           createdAt: state && state.createdAt || Date.now(),
           baselineOnly: true,
-        });
+        };
+        runtime.states.set(key, nextState);
+        if (nextState.seenGenerating) scheduleCompletionCleanup(message, nextState, settings);
         setGuardStatus('守护已开启；当前没有生成，历史楼层只建立基线，不会触发停止。', 'muted');
         return;
       }
@@ -2127,6 +2276,9 @@
           autoContinueUsed: false,
           autoTruncateUsed: alreadyAutoTruncated,
           handled: alreadyHandled,
+          seenGenerating: true,
+          cleanupDone: false,
+          cleanupScheduled: false,
           createdAt: Date.now(),
           baselineOnly: false,
         };
@@ -2148,6 +2300,7 @@
 
       if (maxLength <= state.lastLength && reason !== 'force') return;
       state.lastLength = maxLength;
+      state.seenGenerating = true;
       if (state.stopped) return;
 
       if (detection.hasContentClose && !state.contentClosed) {
