@@ -1,20 +1,21 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.5
+// version: v0.0.6
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.5';
+  const SCRIPT_VERSION = 'v0.0.6';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const STORAGE_KEY = 'th_remove_double_thinking_chain_settings_v1';
   const LOG_KEY = 'th_remove_double_thinking_chain_logs_v1';
   const TRUNCATED_GUARD_KEY = 'th_remove_double_thinking_chain_truncated_guards_v1';
+  const HANDLED_GUARD_KEY = 'th_remove_double_thinking_chain_handled_guards_v1';
   const BACKUP_INDEX_KEY = 'th_remove_double_thinking_chain_backup_dates_v1';
   const BACKUP_DAY_KEY_PREFIX = 'th_remove_double_thinking_chain_deleted_backup_v1:';
   const STYLE_ID = 'th-remove-double-thinking-chain-style-v1';
@@ -46,6 +47,7 @@
   const runtime = {
     states: new Map(),
     autoTruncatedKeys: new Set(),
+    handledKeys: new Set(),
     lastStatus: '',
     lastStatusType: 'muted',
     weakIds: new WeakMap(),
@@ -270,6 +272,23 @@
       sessionStorage.setItem(TRUNCATED_GUARD_KEY, JSON.stringify(Array.from(new Set(guards || [])).slice(-200)));
     } catch (error) {
       console.warn(`[${SCRIPT_NAME}] 保存截断保险丝失败`, error);
+    }
+  }
+
+  function loadHandledGuards() {
+    try {
+      const guards = JSON.parse(sessionStorage.getItem(HANDLED_GUARD_KEY) || '[]');
+      return Array.isArray(guards) ? guards.filter((item) => typeof item === 'string') : [];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function saveHandledGuards(guards) {
+    try {
+      sessionStorage.setItem(HANDLED_GUARD_KEY, JSON.stringify(Array.from(new Set(guards || [])).slice(-200)));
+    } catch (error) {
+      console.warn(`[${SCRIPT_NAME}] 保存触发保险丝失败`, error);
     }
   }
 
@@ -1339,6 +1358,7 @@
       hasContentClose: true,
       trigger: true,
       thinkingIndex: thinking.index,
+      triggerSignature: getTextSignature(text.slice(0, thinking.index)),
       snippet: getSnippetBefore(text, thinking.index),
     };
   }
@@ -1351,10 +1371,7 @@
       record.swipes[swipeIndex] = value;
     }
     if (record.extra && typeof record.extra.display_text === 'string') {
-      const displayDetection = detectDoubleThinkingInText(record.extra.display_text);
-      if (displayDetection.trigger) {
-        record.extra.display_text = record.extra.display_text.slice(0, displayDetection.thinkingIndex);
-      }
+      record.extra.display_text = value;
     }
   }
 
@@ -1367,8 +1384,8 @@
     }
   }
 
-  function refreshMessageBlock(info) {
-    info.context.updateMessageBlock(info.index, info.record);
+  async function refreshMessageBlock(info) {
+    await Promise.resolve(info.context.updateMessageBlock(info.index, info.record));
   }
 
   function findContinueControl() {
@@ -1420,6 +1437,8 @@
       floorLabel: floor.floorLabel,
       logId,
       snippet: detection.snippet || '',
+      thinkingIndex: Number.isFinite(detection.thinkingIndex) ? detection.thinkingIndex : null,
+      triggerSignature: detection.triggerSignature || '',
       stopDelaySeconds: settings.stopDelaySeconds,
       continueDelaySeconds: settings.continueDelaySeconds,
       autoContinue: settings.autoContinue && !state.autoContinueUsed,
@@ -1494,12 +1513,27 @@
       return;
     }
     const rawText = getRecordText(writable.record);
-    const detection = detectDoubleThinkingInText(rawText);
-    if (!detection.trigger) {
-      cancelTask(task, '保存数据中未找到第二个 <thinking>，取消自动截断');
+    const triggerIndex = Number(task.thinkingIndex);
+    if (!Number.isFinite(triggerIndex) || triggerIndex < 0 || triggerIndex >= rawText.length) {
+      cancelTask(task, '原始触发位置已变化，取消自动截断以避免误删续写内容');
       return;
     }
-    const truncated = rawText.slice(0, detection.thinkingIndex);
+    const thinkingAtOriginalIndex = findTag(rawText, 'thinking', triggerIndex, false);
+    if (!thinkingAtOriginalIndex || thinkingAtOriginalIndex.index !== triggerIndex) {
+      cancelTask(task, '原始触发位置已不再是 <thinking>，取消自动截断以避免误删续写内容');
+      return;
+    }
+    const triggerSignature = getTextSignature(rawText.slice(0, triggerIndex));
+    if (task.triggerSignature && triggerSignature !== task.triggerSignature) {
+      cancelTask(task, '原始触发位置前文已变化，取消自动截断以避免误删续写内容');
+      return;
+    }
+    const detection = {
+      thinkingIndex: triggerIndex,
+      snippet: getSnippetBefore(rawText, triggerIndex),
+      triggerSignature,
+    };
+    const truncated = rawText.slice(0, triggerIndex);
     if (truncated === rawText) {
       cancelTask(task, '截断点无效，取消自动截断');
       return;
@@ -1518,9 +1552,13 @@
       return;
     }
     applyRecordText(writable.record, truncated);
-    markAutoTruncated(latest, task, writable);
-    refreshMessageBlock(writable);
+    markAutoTruncated(latest, task, writable, detection);
+    await refreshMessageBlock(writable);
     await saveChatSafely(writable.context);
+    if (getRecordText(writable.record) !== truncated) {
+      cancelTask(task, '截断后读回内容不一致，未记录为已删除');
+      return;
+    }
     if (state) {
       state.truncated = true;
       state.autoTruncateUsed = true;
@@ -1675,7 +1713,15 @@
     return (keys || []).map((key) => `scope:${scope}::${key}`);
   }
 
-  function getAutoTruncatedKeys(message, task, writable) {
+  function getPersistentGuardKeys(keys) {
+    return (keys || []).filter((key) => (
+      key.startsWith('swipe:')
+      || key.startsWith('trigger:')
+      || key.startsWith('record:')
+    ));
+  }
+
+  function getAutoTruncatedKeys(message, task, writable, detection) {
     const keys = new Set();
     if (message) {
       const key = getMessageKey(message);
@@ -1688,6 +1734,14 @@
       if (Number.isFinite(index)) {
         keys.add(`mesid:${index}`);
         keys.add(`floor:${index + 1}`);
+        const context = getTavernContext();
+        const record = context && Array.isArray(context.chat) ? context.chat[index] : null;
+        if (record) {
+          const swipeId = Number.isFinite(Number(record.swipe_id)) ? Number(record.swipe_id) : 0;
+          const swipeCount = Array.isArray(record.swipes) ? record.swipes.length : 0;
+          keys.add(`swipe:${index}:${swipeId}:${swipeCount}`);
+          keys.add(`record:${index}:${swipeId}:${getTextSignature(getRecordText(record).slice(0, 800))}`);
+        }
       }
       const floor = getFloorInfo(message);
       if (Number.isFinite(floor.floorNumber)) keys.add(`floor:${floor.floorNumber}`);
@@ -1705,15 +1759,37 @@
     if (writable && Number.isFinite(writable.index)) {
       keys.add(`mesid:${writable.index}`);
       keys.add(`floor:${writable.index + 1}`);
+      const swipeId = Number.isFinite(Number(writable.record && writable.record.swipe_id)) ? Number(writable.record.swipe_id) : 0;
+      const swipeCount = writable.record && Array.isArray(writable.record.swipes) ? writable.record.swipes.length : 0;
+      keys.add(`swipe:${writable.index}:${swipeId}:${swipeCount}`);
+      keys.add(`record:${writable.index}:${swipeId}:${getTextSignature(getRecordText(writable.record).slice(0, 800))}`);
     }
+    if (detection && detection.triggerSignature) keys.add(`trigger:${detection.triggerSignature}`);
     return Array.from(keys);
   }
 
-  function markAutoTruncated(message, task, writable) {
-    const keys = getAutoTruncatedKeys(message, task, writable);
-    const scopedKeys = getScopedGuardKeys(keys);
+  function markAutoTruncated(message, task, writable, detection) {
+    const keys = getAutoTruncatedKeys(message, task, writable, detection);
+    const persistentKeys = getPersistentGuardKeys(keys);
+    const scopedKeys = getScopedGuardKeys(persistentKeys);
     keys.concat(scopedKeys).forEach((key) => runtime.autoTruncatedKeys.add(key));
     saveTruncatedGuards(loadTruncatedGuards().concat(scopedKeys));
+  }
+
+  function markHandled(message, task, writable, detection) {
+    const keys = getAutoTruncatedKeys(message, task, writable, detection);
+    const persistentKeys = getPersistentGuardKeys(keys);
+    const scopedKeys = getScopedGuardKeys(persistentKeys);
+    keys.concat(scopedKeys).forEach((key) => runtime.handledKeys.add(key));
+    saveHandledGuards(loadHandledGuards().concat(scopedKeys));
+  }
+
+  function hasHandled(message, state, task, writable, detection) {
+    if (state && state.handled) return true;
+    const keys = getPersistentGuardKeys(getAutoTruncatedKeys(message, task, writable, detection));
+    const scopedKeys = getScopedGuardKeys(keys);
+    const savedKeys = new Set(loadHandledGuards());
+    return keys.concat(scopedKeys).some((key) => runtime.handledKeys.has(key) || savedKeys.has(key));
   }
 
   function hasRecentTruncateLog(message, task, writable) {
@@ -1737,13 +1813,12 @@
     });
   }
 
-  function hasAutoTruncated(message, state, task, writable) {
+  function hasAutoTruncated(message, state, task, writable, detection) {
     if (state && state.autoTruncateUsed) return true;
-    const keys = getAutoTruncatedKeys(message, task, writable);
+    const keys = getPersistentGuardKeys(getAutoTruncatedKeys(message, task, writable, detection));
     const scopedKeys = getScopedGuardKeys(keys);
     const savedKeys = new Set(loadTruncatedGuards());
-    return keys.concat(scopedKeys).some((key) => runtime.autoTruncatedKeys.has(key) || savedKeys.has(key))
-      || hasRecentTruncateLog(message, task, writable);
+    return keys.concat(scopedKeys).some((key) => runtime.autoTruncatedKeys.has(key) || savedKeys.has(key));
   }
 
   function getFloorInfo(message) {
@@ -1777,7 +1852,7 @@
     const numericMesid = Number(rawMesid);
     const record = Number.isFinite(numericMesid) ? chat[numericMesid] : chat[chat.length - 1];
     if (!record) return '';
-    return String(record.mes || record.message || record.text || '');
+    return getRecordText(record) || String(record.message || record.text || '');
   }
 
   function getMessageSources(message) {
@@ -1827,6 +1902,15 @@
       .replace(/\s+/g, '');
   }
 
+  function getTextSignature(value) {
+    const text = normalizeTagSource(value).replace(/\s+/g, ' ').trim();
+    let hash = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      hash = Math.imul(31, hash) + text.charCodeAt(index) | 0;
+    }
+    return `${text.length}:${(hash >>> 0).toString(36)}:${text.slice(-40)}`;
+  }
+
   function getSnippetBefore(source, index) {
     const before = normalizeTagSource(source).slice(Math.max(0, index - 500), index);
     const readable = stripTagsForSnippet(before);
@@ -1850,6 +1934,7 @@
         trigger: true,
         sourceKind: source.kind,
         thinkingIndex: thinking.index,
+        triggerSignature: getTextSignature(normalized.slice(0, thinking.index)),
         snippet: getSnippetBefore(normalized, thinking.index),
       };
     }
@@ -1872,6 +1957,7 @@
       stopped: false,
       autoContinueUsed: false,
       autoTruncateUsed: false,
+      handled: hasHandled(message),
       createdAt: Date.now(),
     });
   }
@@ -1899,6 +1985,8 @@
     setGuardStatus(messageText, stopResult.ok ? 'warning' : 'error');
     notify(stopResult.ok ? 'warning' : 'error', messageText);
     if (stopResult.ok) {
+      state.handled = true;
+      markHandled(message, null, null, detection);
       schedulePostStopProcessing(message, state, detection, floor, logId, settings);
     }
   }
@@ -1925,11 +2013,18 @@
       const generationActive = isGenerationActive() === true;
       const detection = detectDoubleThinking(sources);
       let state = runtime.states.get(key);
-      const alreadyAutoTruncated = hasAutoTruncated(message, state);
 
       if (state && state.activeTaskId && runtime.activeTasks.has(state.activeTaskId)) {
         return;
       }
+
+      if (generationActive && state && maxLength + 20 < state.lastLength) {
+        runtime.states.delete(key);
+        state = null;
+      }
+
+      const alreadyAutoTruncated = hasAutoTruncated(message, state, null, null, detection);
+      const alreadyHandled = hasHandled(message, state, null, null, detection);
 
       if (!generationActive) {
         runtime.states.set(key, {
@@ -1938,6 +2033,7 @@
           stopped: false,
           autoContinueUsed: state && state.autoContinueUsed || false,
           autoTruncateUsed: alreadyAutoTruncated,
+          handled: alreadyHandled,
           createdAt: state && state.createdAt || Date.now(),
           baselineOnly: true,
         });
@@ -1952,12 +2048,13 @@
           stopped: false,
           autoContinueUsed: false,
           autoTruncateUsed: alreadyAutoTruncated,
+          handled: alreadyHandled,
           createdAt: Date.now(),
           baselineOnly: false,
         };
         runtime.states.set(key, state);
-        if (detection.trigger && hasAutoTruncated(message, state)) {
-          setGuardStatus('本楼已经自动截断过一次，忽略后续同楼 <thinking> 痕迹，避免误删续写内容。', 'warning');
+        if (detection.trigger && (hasHandled(message, state, null, null, detection) || hasAutoTruncated(message, state, null, null, detection))) {
+          setGuardStatus('本楼已经处理过一次，忽略后续同楼 <thinking>，避免误删续写内容。', 'warning');
           return;
         }
         if (detection.trigger) {
@@ -1980,8 +2077,8 @@
         const floor = getFloorInfo(message);
         setGuardStatus(`已看到 ${floor.floorLabel} 的 </content>，开始警戒后续 <thinking>。`, 'muted');
       }
-      if (detection.trigger && hasAutoTruncated(message, state)) {
-        setGuardStatus('本楼已经自动截断过一次，忽略后续同楼 <thinking> 痕迹，避免误删续写内容。', 'warning');
+      if (detection.trigger && (hasHandled(message, state, null, null, detection) || hasAutoTruncated(message, state, null, null, detection))) {
+        setGuardStatus('本楼已经处理过一次，忽略后续同楼 <thinking>，避免误删续写内容。', 'warning');
         return;
       }
       if (detection.trigger) {
