@@ -1,14 +1,14 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.7
+// version: v0.0.8
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.7';
+  const SCRIPT_VERSION = 'v0.0.8';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -24,6 +24,7 @@
   const PANEL_ID = 'th-remove-double-thinking-chain-panel';
   const MAX_LOGS = 80;
   const MAX_BACKUP_DAYS = 14;
+  const ABNORMAL_THINKING_OBSERVE_LIMIT = 500;
 
   const DEFAULT_SETTINGS = {
     enabled: true,
@@ -1043,6 +1044,7 @@
           <span class="th-rdt-log-time">${escapeHtml(formatTime(log.time))}</span>
         </div>
         <div class="th-rdt-log-snippet">前 10 字：${escapeHtml(log.snippet || '（空）')}</div>
+        ${log.classificationReason ? `<div class="th-rdt-log-method">判定：${escapeHtml(log.classificationReason)}</div>` : ''}
         <div class="th-rdt-log-method">停止方式：${escapeHtml(log.stopMethod || log.stopError || '已尝试停止')}</div>
         <div class="th-rdt-log-method">截断：${escapeHtml(log.truncateMethod || log.truncateError || log.truncateStatus || '未执行')}</div>
         <div class="th-rdt-log-method">续写：${escapeHtml(log.continueMethod || log.continueError || log.continueStatus || '未执行')}</div>
@@ -1350,17 +1352,27 @@
     if (!contentClose) {
       return { hasContentClose: false, trigger: false };
     }
-    const thinking = findTag(text, 'thinking', contentClose.index + contentClose.length, false);
-    if (!thinking) {
-      return { hasContentClose: true, trigger: false };
+    let searchIndex = contentClose.index + contentClose.length;
+    while (searchIndex < text.length) {
+      const thinking = findTag(text, 'thinking', searchIndex, false);
+      if (!thinking) break;
+      const classification = classifyThinkingBlock(text, thinking);
+      if (classification.kind === 'abnormal') {
+        return {
+          hasContentClose: true,
+          trigger: true,
+          thinkingIndex: thinking.index,
+          triggerSignature: getTextSignature(text.slice(0, thinking.index)),
+          snippet: getSnippetBefore(text, thinking.index),
+          classificationReason: classification.reason,
+        };
+      }
+      if (classification.kind === 'observing') {
+        return { hasContentClose: true, trigger: false, observing: true };
+      }
+      searchIndex = Math.max(classification.nextIndex || thinking.index + thinking.length, thinking.index + thinking.length);
     }
-    return {
-      hasContentClose: true,
-      trigger: true,
-      thinkingIndex: thinking.index,
-      triggerSignature: getTextSignature(text.slice(0, thinking.index)),
-      snippet: getSnippetBefore(text, thinking.index),
-    };
+    return { hasContentClose: true, trigger: false };
   }
 
   function applyRecordText(record, text) {
@@ -1913,6 +1925,53 @@
     return `${text.length}:${(hash >>> 0).toString(36)}:${text.slice(-40)}`;
   }
 
+  function getThinkingBodyPreview(text, thinking) {
+    const start = thinking.index + thinking.length;
+    return normalizeTagSource(text.slice(start, start + ABNORMAL_THINKING_OBSERVE_LIMIT));
+  }
+
+  function classifyThinkingBlock(text, thinking) {
+    const preview = getThinkingBodyPreview(text, thinking);
+    const compact = preview.replace(/\s+/g, '');
+    const lower = compact.toLowerCase();
+    const primaryMatches = /pluto/i.test(preview) && /系统|要求/.test(preview);
+    const supportMatches = [
+      'user_input',
+      'cot回答',
+      'step0',
+      '输入确认',
+      '能否做到',
+      '中文母语使用者',
+      '优秀创作者',
+      '不再进行任何额外的思考',
+      '自作聪明地预设剧情',
+    ].filter((keyword) => lower.includes(keyword.toLowerCase()));
+    if (primaryMatches && (supportMatches.length >= 1 || preview.length >= 120)) {
+      return {
+        kind: 'abnormal',
+        reason: supportMatches.length
+          ? `命中异常开场：PLUTO + ${supportMatches[0]}`
+          : '命中异常开场：PLUTO 固定复盘',
+      };
+    }
+    const close = findTag(text, 'thinking', thinking.index + thinking.length, true);
+    if (close) {
+      return {
+        kind: 'benign',
+        nextIndex: close.index + close.length,
+      };
+    }
+    if (text.length - thinking.index < ABNORMAL_THINKING_OBSERVE_LIMIT) {
+      return {
+        kind: 'observing',
+      };
+    }
+    return {
+      kind: 'unknown',
+      nextIndex: thinking.index + thinking.length,
+    };
+  }
+
   function getSnippetBefore(source, index) {
     const before = normalizeTagSource(source).slice(Math.max(0, index - 500), index);
     const readable = stripTagsForSnippet(before);
@@ -1929,16 +1988,32 @@
       if (!contentClose) continue;
       sawContentClose = true;
       if (!contentCloseSourceKind) contentCloseSourceKind = source.kind;
-      const thinking = findTag(normalized, 'thinking', contentClose.index + contentClose.length, false);
-      if (!thinking) continue;
-      return {
-        hasContentClose: true,
-        trigger: true,
-        sourceKind: source.kind,
-        thinkingIndex: thinking.index,
-        triggerSignature: getTextSignature(normalized.slice(0, thinking.index)),
-        snippet: getSnippetBefore(normalized, thinking.index),
-      };
+      let searchIndex = contentClose.index + contentClose.length;
+      while (searchIndex < normalized.length) {
+        const thinking = findTag(normalized, 'thinking', searchIndex, false);
+        if (!thinking) break;
+        const classification = classifyThinkingBlock(normalized, thinking);
+        if (classification.kind === 'abnormal') {
+          return {
+            hasContentClose: true,
+            trigger: true,
+            sourceKind: source.kind,
+            thinkingIndex: thinking.index,
+            triggerSignature: getTextSignature(normalized.slice(0, thinking.index)),
+            snippet: getSnippetBefore(normalized, thinking.index),
+            classificationReason: classification.reason,
+          };
+        }
+        if (classification.kind === 'observing') {
+          return {
+            hasContentClose: true,
+            trigger: false,
+            sourceKind: source.kind,
+            observing: true,
+          };
+        }
+        searchIndex = Math.max(classification.nextIndex || thinking.index + thinking.length, thinking.index + thinking.length);
+      }
     }
     return {
       hasContentClose: sawContentClose,
@@ -1975,6 +2050,7 @@
       rawMesid: floor.rawMesid || '',
       snippet: detection.snippet || '',
       sourceKind: detection.sourceKind || '',
+      classificationReason: detection.classificationReason || '',
       stopMethod: stopResult.ok ? stopResult.method : '',
       stopError: stopResult.ok ? '' : stopResult.error,
       truncateStatus: stopResult.ok && settings.autoTruncate ? `等待 ${settings.stopDelaySeconds} 秒后截断` : '未开启自动截断',
