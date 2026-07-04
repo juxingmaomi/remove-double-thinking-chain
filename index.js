@@ -1,14 +1,14 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.11
+// version: v0.0.12
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.11';
+  const SCRIPT_VERSION = 'v0.0.12';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -425,6 +425,20 @@
     } catch (error) {
       return String(value);
     }
+  }
+
+  function getLogFlowText(log) {
+    if (!log) return '';
+    if (log.flowStatus) return String(log.flowStatus);
+    if (log.cleanupMethod) return String(log.cleanupMethod);
+    if (log.cleanupError) return String(log.cleanupError);
+    if (log.continueMethod) return String(log.continueMethod);
+    if (log.continueError) return String(log.continueError);
+    if (log.truncateMethod) return String(log.truncateMethod);
+    if (log.truncateError) return String(log.truncateError);
+    if (log.stopMethod) return String(log.stopMethod);
+    if (log.stopError) return String(log.stopError);
+    return '';
   }
 
   function setGuardStatus(text, type = 'muted') {
@@ -1009,10 +1023,12 @@
           <span class="th-rdt-log-time">${escapeHtml(formatTime(log.time))}</span>
         </div>
         <div class="th-rdt-log-snippet">前 10 字：${escapeHtml(log.snippet || '（空）')}</div>
+        ${getLogFlowText(log) ? `<div class="th-rdt-log-method">流程：${escapeHtml(getLogFlowText(log))}</div>` : ''}
         ${log.classificationReason ? `<div class="th-rdt-log-method">判定：${escapeHtml(log.classificationReason)}</div>` : ''}
-        <div class="th-rdt-log-method">停止方式：${escapeHtml(log.stopMethod || log.stopError || '已尝试停止')}</div>
+        <div class="th-rdt-log-method">停止：${escapeHtml(log.stopMethod || log.stopError || '已尝试停止')}</div>
         <div class="th-rdt-log-method">截断：${escapeHtml(log.truncateMethod || log.truncateError || log.truncateStatus || '未执行')}</div>
         <div class="th-rdt-log-method">续写：${escapeHtml(log.continueMethod || log.continueError || log.continueStatus || '未执行')}</div>
+        ${log.cleanupMethod || log.cleanupError || log.cleanupStatus ? `<div class="th-rdt-log-method">收笔清理：${escapeHtml(log.cleanupMethod || log.cleanupError || log.cleanupStatus)}</div>` : ''}
       </div>
     `).join('');
   }
@@ -1444,21 +1460,29 @@
     if (state && state.activeTaskId === task.id) {
       state.activeTaskId = '';
     }
-    updateLog(task.logId, { truncateError: reason });
+    updateLog(task.logId, {
+      truncateError: reason,
+      flowStatus: `已取消：${reason}`,
+    });
     setGuardStatus(reason, 'warning');
+    notify('warning', reason);
   }
 
   function schedulePostStopProcessing(message, state, detection, floor, logId, settings) {
     if (!settings.autoTruncate) {
       updateLog(logId, {
-        truncateStatus: '未开启自动截断',
-        continueStatus: '未开启自动截断，跳过续写',
+        flowStatus: '已检测异常 thinking，已停止；未开启自动删除',
+        truncateStatus: '未开启自动删除',
+        continueStatus: '未开启自动删除，跳过自动续写',
       });
       return;
     }
     const task = createTask(message, state, detection, floor, logId, settings);
     const delayMs = task.stopDelaySeconds * 1000;
-    updateLog(logId, { truncateStatus: `等待 ${task.stopDelaySeconds} 秒后截断` });
+    updateLog(logId, {
+      flowStatus: `已检测异常 thinking，已停止；等待 ${task.stopDelaySeconds} 秒后删除异常 thinking`,
+      truncateStatus: `等待 ${task.stopDelaySeconds} 秒后删除异常 thinking`,
+    });
     setGuardStatus(`已停止 ${floor.floorLabel}；等待 ${task.stopDelaySeconds} 秒后删除第二个 <thinking> 起的内容。`, 'warning');
     scheduleAction(() => {
       runTruncateTask(task).catch((error) => {
@@ -1541,20 +1565,31 @@
       state.contentClosed = true;
     }
     const removedCount = rawText.length - truncated.length;
+    const nextFlowStatus = task.autoContinue
+      ? `已删除异常 thinking，共 ${removedCount} 字符；等待 ${task.continueDelaySeconds} 秒后点击续写`
+      : `已删除异常 thinking，共 ${removedCount} 字符；未开启自动续写`;
     updateLog(task.logId, {
       snippet: detection.snippet || task.snippet,
-      truncateMethod: `已删除 ${removedCount} 字符`,
+      flowStatus: nextFlowStatus,
+      truncateMethod: `已删除异常 thinking，共 ${removedCount} 字符`,
       truncateError: '',
       backupDate: backupResult.dateKey,
       truncatedAt: new Date().toISOString(),
     });
     setGuardStatus(`已精确删除 ${task.floorLabel} 第二个 <thinking> 起的 ${removedCount} 个字符。`, 'warning');
+    notify('warning', `已删除异常 thinking：${task.floorLabel}，共 ${removedCount} 字符`);
 
     if (task.autoContinue) {
-      updateLog(task.logId, { continueStatus: `等待 ${task.continueDelaySeconds} 秒后续写` });
+      updateLog(task.logId, {
+        flowStatus: `已删除异常 thinking，共 ${removedCount} 字符；等待 ${task.continueDelaySeconds} 秒后点击续写`,
+        continueStatus: `等待 ${task.continueDelaySeconds} 秒后点击续写`,
+      });
       scheduleAction(() => runContinueTask(task), task.continueDelaySeconds * 1000);
     } else {
-      updateLog(task.logId, { continueStatus: '未开启自动续写，或本楼已自动续写过一次' });
+      updateLog(task.logId, {
+        flowStatus: `已删除异常 thinking，共 ${removedCount} 字符；未开启自动续写`,
+        continueStatus: '未开启自动续写',
+      });
       if (state && state.activeTaskId === task.id) {
         state.activeTaskId = '';
       }
@@ -1567,8 +1602,12 @@
     const state = runtime.states.get(task.key);
     const latest = getLatestAssistantMessage();
     if (!latest || getMessageKey(latest) !== task.key) {
-      updateLog(task.logId, { continueError: '当前最后一楼已变化，取消自动续写' });
+      updateLog(task.logId, {
+        flowStatus: '自动续写已取消：当前最后一楼已变化',
+        continueError: '当前最后一楼已变化，取消自动续写',
+      });
       setGuardStatus('当前最后一楼已变化，取消自动续写。', 'warning');
+      notify('warning', '自动续写已取消：当前最后一楼已变化');
       if (state && state.activeTaskId === task.id) {
         state.activeTaskId = '';
       }
@@ -1577,6 +1616,10 @@
     }
     const result = continueCurrentGeneration();
     if (result.ok) {
+      const settings = loadSettings();
+      const continueFlowStatus = settings.cleanupContinuationThinking
+        ? '已点击续写；等待生成完成后按收笔标记清理续写 thinking'
+        : '已点击续写；未开启收笔清理';
       if (state) {
         state.stopped = false;
         state.autoContinueUsed = true;
@@ -1585,14 +1628,20 @@
         state.activeTaskId = '';
       }
       updateLog(task.logId, {
-        continueMethod: result.method,
+        flowStatus: continueFlowStatus,
+        continueMethod: `已点击续写（${result.method}）`,
         continueStatus: '',
         continuedAt: new Date().toISOString(),
       });
       setGuardStatus(`已为 ${task.floorLabel} 触发自动续写；本楼不会再次自动续写。`, 'warning');
+      notify('success', `已点击续写：${task.floorLabel}`);
     } else {
-      updateLog(task.logId, { continueError: result.error });
+      updateLog(task.logId, {
+        flowStatus: `自动续写失败：${result.error}`,
+        continueError: `自动续写失败：${result.error}`,
+      });
       setGuardStatus(`自动续写失败：${result.error}`, 'error');
+      notify('error', `自动续写失败：${result.error}`);
     }
     if (state && state.activeTaskId === task.id) {
       state.activeTaskId = '';
@@ -1613,18 +1662,32 @@
       return;
     }
     state.cleanupScheduled = true;
+    if (state.lastFlowLogId) {
+      updateLog(state.lastFlowLogId, {
+        flowStatus: `检测到此处收笔；等待 ${settings.cleanupDelaySeconds} 秒后删除续写 thinking`,
+        cleanupStatus: `等待 ${settings.cleanupDelaySeconds} 秒后删除续写 thinking`,
+      });
+    }
     setGuardStatus(`检测到此处收笔，等待 ${settings.cleanupDelaySeconds} 秒后清理续写 thinking。`, 'muted');
     scheduleAction(() => {
       runCompletionCleanupTask({
         key,
         rawMesid: String(writable.index),
         floorLabel: getFloorInfo(message).floorLabel,
+        logId: state.lastFlowLogId || '',
         cleanupDelaySeconds: settings.cleanupDelaySeconds,
       }).catch((error) => {
         const currentState = runtime.states.get(key);
         if (currentState) currentState.cleanupScheduled = false;
         console.warn(`[${SCRIPT_NAME}] 清理续写 thinking 失败`, error);
         setGuardStatus(`清理续写 thinking 失败：${error.message || error}`, 'error');
+        if (state.lastFlowLogId) {
+          updateLog(state.lastFlowLogId, {
+            flowStatus: `删除续写 thinking 失败：${error.message || error}`,
+            cleanupError: `删除续写 thinking 失败：${error.message || error}`,
+          });
+        }
+        notify('error', `删除续写 thinking 失败：${error.message || error}`);
       });
     }, settings.cleanupDelaySeconds * 1000);
   }
@@ -1643,6 +1706,12 @@
     const ranges = findContinuationThinkingCleanupRanges(rawText);
     if (!ranges.length) {
       if (state) state.cleanupDone = true;
+      if (task.logId) {
+        updateLog(task.logId, {
+          flowStatus: '收笔后未发现可删除的续写 thinking',
+          cleanupStatus: '未发现可删除的续写 thinking',
+        });
+      }
       return;
     }
     const removedText = ranges.map((range, index) => `#${index + 1}\n${range.text}`).join('\n\n---\n\n');
@@ -1656,7 +1725,14 @@
       reason: 'completion-cleanup',
     });
     if (!backupResult.ok) {
+      if (task.logId) {
+        updateLog(task.logId, {
+          flowStatus: `删除续写 thinking 已取消：备份失败`,
+          cleanupError: `备份失败，未删除续写 thinking：${backupResult.error}`,
+        });
+      }
       setGuardStatus(`保存续写 thinking 备份失败，已取消清理：${backupResult.error}`, 'error');
+      notify('error', `保存续写 thinking 备份失败，未删除：${backupResult.error}`);
       return;
     }
     let cleaned = rawText;
@@ -1668,24 +1744,42 @@
     await refreshMessageBlock(writable);
     await saveChatSafely(writable.context);
     if (getRecordText(writable.record) !== cleaned) {
+      if (task.logId) {
+        updateLog(task.logId, {
+          flowStatus: '删除续写 thinking 后读回不一致，未记录为成功',
+          cleanupError: '删除续写 thinking 后读回不一致，未记录为成功',
+        });
+      }
       setGuardStatus('清理后读回内容不一致，未记录为成功。', 'warning');
+      notify('warning', '删除续写 thinking 后读回不一致，未记录为成功');
       return;
     }
     if (state) {
       state.cleanupDone = true;
       state.lastLength = cleaned.length;
     }
-    addLog({
+    const cleanupPatch = {
       floorLabel: task.floorLabel,
       floorNumber: Number.isFinite(writable.index) ? writable.index + 1 : null,
       rawMesid: String(writable.index),
       snippet: ranges[0].snippet || '',
-      stopMethod: '生成完成后清理',
-      truncateMethod: `已清理 ${ranges.length} 段续写 thinking，共 ${removedText.length} 字符`,
-      backupDate: backupResult.dateKey,
-      classificationReason: '此处收笔后清理完整闭合续写 thinking',
-    });
+      flowStatus: `收笔后已删除续写 thinking，共 ${removedText.length} 字符`,
+      cleanupMethod: `已删除续写 thinking ${ranges.length} 段，共 ${removedText.length} 字符`,
+      cleanupStatus: '',
+      cleanupBackupDate: backupResult.dateKey,
+      cleanupAt: new Date().toISOString(),
+    };
+    if (task.logId) {
+      updateLog(task.logId, cleanupPatch);
+    } else {
+      addLog(Object.assign({
+        stopMethod: '生成完成后清理',
+        classificationReason: '此处收笔后清理完整闭合续写 thinking',
+        backupDate: backupResult.dateKey,
+      }, cleanupPatch));
+    }
     setGuardStatus(`已在收笔后清理 ${task.floorLabel} 的 ${ranges.length} 段续写 thinking。`, 'warning');
+    notify('success', `已删除续写 thinking：${task.floorLabel}，共 ${removedText.length} 字符`);
   }
 
   function getChatContainer() {
@@ -1885,17 +1979,46 @@
     return normalizeTagSource(text.slice(start, start + ABNORMAL_THINKING_OBSERVE_LIMIT));
   }
 
-  function hasFixedAbnormalThinkingOpening(preview) {
+  function getAbnormalThinkingOpeningMatch(preview) {
     const compactHead = String(preview || '').replace(/\s+/g, '').slice(0, 180).toLowerCase();
-    return compactHead.includes('我完全遵循pluto系统的要求');
+    if (compactHead.includes('我完全遵循pluto系统的要求')) {
+      return {
+        matched: true,
+        reason: '命中固定异常开场：我完全遵循PLUTO系统的要求',
+      };
+    }
+    if (!compactHead.includes('pluto')) {
+      return { matched: false };
+    }
+    const keywords = [
+      '完全遵循',
+      '遵循',
+      '系统的要求',
+      '系统要求',
+      '中文母语使用者',
+      '优秀创作者',
+      '所有步骤结束后',
+      '额外的思考',
+      '自我否定',
+    ];
+    const hits = keywords.filter((keyword) => compactHead.includes(keyword.toLowerCase()));
+    const strongHits = Array.from(new Set(hits.filter((keyword) => keyword !== '遵循')));
+    if (strongHits.length >= 2 || hits.length >= 3) {
+      return {
+        matched: true,
+        reason: `命中异常关键词组合：PLUTO + ${strongHits.slice(0, 3).join(' / ')}`,
+      };
+    }
+    return { matched: false };
   }
 
   function classifyThinkingBlock(text, thinking) {
     const preview = getThinkingBodyPreview(text, thinking);
-    if (hasFixedAbnormalThinkingOpening(preview)) {
+    const abnormalOpening = getAbnormalThinkingOpeningMatch(preview);
+    if (abnormalOpening.matched) {
       return {
         kind: 'abnormal',
-        reason: '命中固定异常开场：我完全遵循PLUTO系统的要求',
+        reason: abnormalOpening.reason,
       };
     }
     const close = findTag(text, 'thinking', thinking.index + thinking.length, true);
@@ -2036,6 +2159,7 @@
       seenGenerating: false,
       cleanupDone: false,
       cleanupScheduled: false,
+      lastFlowLogId: '',
       createdAt: Date.now(),
     });
   }
@@ -2045,6 +2169,11 @@
     const floor = getFloorInfo(message);
     const stopResult = stopCurrentGeneration();
     const settings = loadSettings();
+    const initialFlowStatus = stopResult.ok
+      ? (settings.autoTruncate
+        ? `已检测异常 thinking，已停止；等待 ${settings.stopDelaySeconds} 秒后删除异常 thinking`
+        : '已检测异常 thinking，已停止；未开启自动删除')
+      : `已检测异常 thinking；停止失败：${stopResult.error}`;
     const entry = {
       floorLabel: floor.floorLabel,
       floorNumber: floor.floorNumber,
@@ -2052,15 +2181,17 @@
       snippet: detection.snippet || '',
       sourceKind: detection.sourceKind || '',
       classificationReason: detection.classificationReason || '',
-      stopMethod: stopResult.ok ? stopResult.method : '',
-      stopError: stopResult.ok ? '' : stopResult.error,
-      truncateStatus: stopResult.ok && settings.autoTruncate ? `等待 ${settings.stopDelaySeconds} 秒后截断` : '未开启自动截断',
-      continueStatus: settings.autoContinue ? `截断后等待 ${settings.continueDelaySeconds} 秒续写` : '未开启自动续写',
+      flowStatus: initialFlowStatus,
+      stopMethod: stopResult.ok ? `已停止（${stopResult.method}）` : '',
+      stopError: stopResult.ok ? '' : `停止失败：${stopResult.error}`,
+      truncateStatus: stopResult.ok && settings.autoTruncate ? `等待 ${settings.stopDelaySeconds} 秒后删除异常 thinking` : '未开启自动删除',
+      continueStatus: settings.autoContinue ? `删除后等待 ${settings.continueDelaySeconds} 秒点击续写` : '未开启自动续写',
     };
     const logId = addLog(entry);
+    state.lastFlowLogId = logId;
     const messageText = stopResult.ok
-      ? `检测到 </content> 后的新 <thinking>，已停止：${floor.floorLabel}`
-      : `检测到新 <thinking>，但未找到停止入口：${floor.floorLabel}`;
+      ? `检测到异常 thinking，已停止：${floor.floorLabel}`
+      : `检测到异常 thinking，但停止失败：${floor.floorLabel}`;
     setGuardStatus(messageText, stopResult.ok ? 'warning' : 'error');
     notify(stopResult.ok ? 'warning' : 'error', messageText);
     if (stopResult.ok) {
@@ -2125,6 +2256,7 @@
           seenGenerating: state && state.seenGenerating || false,
           cleanupDone: state && state.cleanupDone || false,
           cleanupScheduled: state && state.cleanupScheduled || false,
+          lastFlowLogId: state && state.lastFlowLogId || '',
           createdAt: state && state.createdAt || Date.now(),
           baselineOnly: true,
         };
@@ -2144,6 +2276,7 @@
           seenGenerating: true,
           cleanupDone: false,
           cleanupScheduled: false,
+          lastFlowLogId: '',
           createdAt: Date.now(),
           baselineOnly: false,
         };
