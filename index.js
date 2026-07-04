@@ -1,14 +1,14 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.9
+// version: v0.0.10
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.9';
+  const SCRIPT_VERSION = 'v0.0.10';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -2038,7 +2038,7 @@
     const preview = getThinkingBodyPreview(text, thinking);
     const compact = preview.replace(/\s+/g, '');
     const lower = compact.toLowerCase();
-    const primaryMatches = /pluto/i.test(preview) && /系统|要求/.test(preview);
+    const primaryMatches = /pluto/i.test(preview) && /(?:\u7cfb\u7edf|\u8981\u6c42)/.test(preview);
     const supportMatches = [
       'user_input',
       'cot回答',
@@ -2050,7 +2050,7 @@
       '不再进行任何额外的思考',
       '自作聪明地预设剧情',
     ].filter((keyword) => lower.includes(keyword.toLowerCase()));
-    if (primaryMatches && (supportMatches.length >= 1 || preview.length >= 120)) {
+    if (primaryMatches) {
       return {
         kind: 'abnormal',
         reason: supportMatches.length
@@ -2123,6 +2123,7 @@
   function detectDoubleThinking(sources) {
     let sawContentClose = false;
     let contentCloseSourceKind = '';
+    let observingSourceKind = '';
     for (const source of sources) {
       const normalized = normalizeTagSource(source.value);
       const contentClose = findTag(normalized, 'content', 0, true);
@@ -2146,15 +2147,19 @@
           };
         }
         if (classification.kind === 'observing') {
-          return {
-            hasContentClose: true,
-            trigger: false,
-            sourceKind: source.kind,
-            observing: true,
-          };
+          if (!observingSourceKind) observingSourceKind = source.kind;
+          break;
         }
         searchIndex = Math.max(classification.nextIndex || thinking.index + thinking.length, thinking.index + thinking.length);
       }
+    }
+    if (observingSourceKind) {
+      return {
+        hasContentClose: true,
+        trigger: false,
+        sourceKind: observingSourceKind,
+        observing: true,
+      };
     }
     return {
       hasContentClose: sawContentClose,
