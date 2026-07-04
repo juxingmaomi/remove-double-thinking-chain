@@ -1,21 +1,19 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.10
+// version: v0.0.11
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.10';
+  const SCRIPT_VERSION = 'v0.0.11';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   const STORAGE_KEY = 'th_remove_double_thinking_chain_settings_v1';
   const LOG_KEY = 'th_remove_double_thinking_chain_logs_v1';
-  const TRUNCATED_GUARD_KEY = 'th_remove_double_thinking_chain_truncated_guards_v1';
-  const HANDLED_GUARD_KEY = 'th_remove_double_thinking_chain_handled_guards_v1';
   const BACKUP_INDEX_KEY = 'th_remove_double_thinking_chain_backup_dates_v1';
   const BACKUP_DAY_KEY_PREFIX = 'th_remove_double_thinking_chain_deleted_backup_v1:';
   const STYLE_ID = 'th-remove-double-thinking-chain-style-v1';
@@ -50,8 +48,6 @@
 
   const runtime = {
     states: new Map(),
-    autoTruncatedKeys: new Set(),
-    handledKeys: new Set(),
     lastStatus: '',
     lastStatusType: 'muted',
     weakIds: new WeakMap(),
@@ -262,40 +258,6 @@
     const next = normalizeSettings(Object.assign({}, loadSettings(), settings || {}));
     localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
     return next;
-  }
-
-  function loadTruncatedGuards() {
-    try {
-      const guards = JSON.parse(sessionStorage.getItem(TRUNCATED_GUARD_KEY) || '[]');
-      return Array.isArray(guards) ? guards.filter((item) => typeof item === 'string') : [];
-    } catch (error) {
-      return [];
-    }
-  }
-
-  function saveTruncatedGuards(guards) {
-    try {
-      sessionStorage.setItem(TRUNCATED_GUARD_KEY, JSON.stringify(Array.from(new Set(guards || [])).slice(-200)));
-    } catch (error) {
-      console.warn(`[${SCRIPT_NAME}] 保存截断保险丝失败`, error);
-    }
-  }
-
-  function loadHandledGuards() {
-    try {
-      const guards = JSON.parse(sessionStorage.getItem(HANDLED_GUARD_KEY) || '[]');
-      return Array.isArray(guards) ? guards.filter((item) => typeof item === 'string') : [];
-    } catch (error) {
-      return [];
-    }
-  }
-
-  function saveHandledGuards(guards) {
-    try {
-      sessionStorage.setItem(HANDLED_GUARD_KEY, JSON.stringify(Array.from(new Set(guards || [])).slice(-200)));
-    } catch (error) {
-      console.warn(`[${SCRIPT_NAME}] 保存触发保险丝失败`, error);
-    }
   }
 
   function loadLogs() {
@@ -511,7 +473,6 @@
         border-radius: 15px;
         background: #1f6ed4;
         color: #ffffff;
-        box-shadow: 0 10px 26px rgba(0, 0, 0, 0.34);
         font-size: 22px;
         line-height: 50px;
         text-align: center;
@@ -553,7 +514,6 @@
         border-radius: 12px;
         background: #151b22;
         color: #eef3ef;
-        box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
       }
       #${PANEL_ID}[data-open="true"] {
         display: flex;
@@ -1376,6 +1336,7 @@
       if (classification.kind === 'abnormal') {
         return {
           hasContentClose: true,
+          contentCloseIndex: contentClose.index,
           trigger: true,
           thinkingIndex: thinking.index,
           triggerSignature: getTextSignature(text.slice(0, thinking.index)),
@@ -1384,11 +1345,11 @@
         };
       }
       if (classification.kind === 'observing') {
-        return { hasContentClose: true, trigger: false, observing: true };
+        return { hasContentClose: true, contentCloseIndex: contentClose.index, trigger: false, observing: true };
       }
       searchIndex = Math.max(classification.nextIndex || thinking.index + thinking.length, thinking.index + thinking.length);
     }
-    return { hasContentClose: true, trigger: false };
+    return { hasContentClose: true, contentCloseIndex: contentClose.index, trigger: false };
   }
 
   function applyRecordText(record, text) {
@@ -1495,14 +1456,6 @@
       });
       return;
     }
-    if (hasAutoTruncated(message, state)) {
-      updateLog(logId, {
-        truncateStatus: '本楼已自动截断过一次，为避免误删续写内容，跳过再次截断',
-        continueStatus: '跳过再次截断，因此不自动续写',
-      });
-      setGuardStatus(`${floor.floorLabel} 已自动截断过一次；本次只停止，不再自动删除。`, 'warning');
-      return;
-    }
     const task = createTask(message, state, detection, floor, logId, settings);
     const delayMs = task.stopDelaySeconds * 1000;
     updateLog(logId, { truncateStatus: `等待 ${task.stopDelaySeconds} 秒后截断` });
@@ -1534,10 +1487,6 @@
     }
     if (task.rawMesid && String(writable.index) !== String(task.rawMesid)) {
       cancelTask(task, '消息楼层编号变化，取消自动截断');
-      return;
-    }
-    if (hasAutoTruncated(latest, state, task, writable)) {
-      cancelTask(task, '本楼已经自动截断过一次，取消重复截断以保护续写内容');
       return;
     }
     const rawText = getRecordText(writable.record);
@@ -1580,7 +1529,6 @@
       return;
     }
     applyRecordText(writable.record, truncated);
-    markAutoTruncated(latest, task, writable, detection);
     await refreshMessageBlock(writable);
     await saveChatSafely(writable.context);
     if (getRecordText(writable.record) !== truncated) {
@@ -1589,7 +1537,6 @@
     }
     if (state) {
       state.truncated = true;
-      state.autoTruncateUsed = true;
       state.lastLength = truncated.length;
       state.contentClosed = true;
     }
@@ -1826,119 +1773,6 @@
     return parts.join('|');
   }
 
-  function getScopedGuardKeys(keys) {
-    const scope = getGuardScope();
-    return (keys || []).map((key) => `scope:${scope}::${key}`);
-  }
-
-  function getPersistentGuardKeys(keys) {
-    return (keys || []).filter((key) => (
-      key.startsWith('swipe:')
-      || key.startsWith('trigger:')
-      || key.startsWith('record:')
-    ));
-  }
-
-  function getAutoTruncatedKeys(message, task, writable, detection) {
-    const keys = new Set();
-    if (message) {
-      const key = getMessageKey(message);
-      if (key && key !== 'none') keys.add(key);
-      if (Number.isFinite(message.index)) {
-        keys.add(`visible-index:${message.index}`);
-        keys.add(`floor:${message.index + 1}`);
-      }
-      const index = getNumericMessageId(message);
-      if (Number.isFinite(index)) {
-        keys.add(`mesid:${index}`);
-        keys.add(`floor:${index + 1}`);
-        const context = getTavernContext();
-        const record = context && Array.isArray(context.chat) ? context.chat[index] : null;
-        if (record) {
-          const swipeId = Number.isFinite(Number(record.swipe_id)) ? Number(record.swipe_id) : 0;
-          const swipeCount = Array.isArray(record.swipes) ? record.swipes.length : 0;
-          keys.add(`swipe:${index}:${swipeId}:${swipeCount}`);
-          keys.add(`record:${index}:${swipeId}:${getTextSignature(getRecordText(record).slice(0, 800))}`);
-        }
-      }
-      const floor = getFloorInfo(message);
-      if (Number.isFinite(floor.floorNumber)) keys.add(`floor:${floor.floorNumber}`);
-      if (floor.rawMesid != null && String(floor.rawMesid).trim() !== '') keys.add(`mesid:${String(floor.rawMesid).trim()}`);
-    }
-    if (task) {
-      if (task.key) keys.add(task.key);
-      if (task.rawMesid != null && String(task.rawMesid).trim() !== '') {
-        const rawMesid = String(task.rawMesid).trim();
-        keys.add(`mesid:${rawMesid}`);
-        const numericMesid = Number(rawMesid);
-        if (Number.isFinite(numericMesid)) keys.add(`floor:${numericMesid + 1}`);
-      }
-    }
-    if (writable && Number.isFinite(writable.index)) {
-      keys.add(`mesid:${writable.index}`);
-      keys.add(`floor:${writable.index + 1}`);
-      const swipeId = Number.isFinite(Number(writable.record && writable.record.swipe_id)) ? Number(writable.record.swipe_id) : 0;
-      const swipeCount = writable.record && Array.isArray(writable.record.swipes) ? writable.record.swipes.length : 0;
-      keys.add(`swipe:${writable.index}:${swipeId}:${swipeCount}`);
-      keys.add(`record:${writable.index}:${swipeId}:${getTextSignature(getRecordText(writable.record).slice(0, 800))}`);
-    }
-    if (detection && detection.triggerSignature) keys.add(`trigger:${detection.triggerSignature}`);
-    return Array.from(keys);
-  }
-
-  function markAutoTruncated(message, task, writable, detection) {
-    const keys = getAutoTruncatedKeys(message, task, writable, detection);
-    const persistentKeys = getPersistentGuardKeys(keys);
-    const scopedKeys = getScopedGuardKeys(persistentKeys);
-    scopedKeys.forEach((key) => runtime.autoTruncatedKeys.add(key));
-    saveTruncatedGuards(loadTruncatedGuards().concat(scopedKeys));
-  }
-
-  function markHandled(message, task, writable, detection) {
-    const keys = getAutoTruncatedKeys(message, task, writable, detection);
-    const persistentKeys = getPersistentGuardKeys(keys);
-    const scopedKeys = getScopedGuardKeys(persistentKeys);
-    scopedKeys.forEach((key) => runtime.handledKeys.add(key));
-    saveHandledGuards(loadHandledGuards().concat(scopedKeys));
-  }
-
-  function hasHandled(message, state, task, writable, detection) {
-    if (state && state.handled) return true;
-    const keys = getPersistentGuardKeys(getAutoTruncatedKeys(message, task, writable, detection));
-    const scopedKeys = getScopedGuardKeys(keys);
-    const savedKeys = new Set(loadHandledGuards());
-    return scopedKeys.some((key) => runtime.handledKeys.has(key) || savedKeys.has(key));
-  }
-
-  function hasRecentTruncateLog(message, task, writable) {
-    const floor = getFloorInfo(message);
-    const rawMesid = task && task.rawMesid != null && String(task.rawMesid).trim() !== ''
-      ? String(task.rawMesid).trim()
-      : floor.rawMesid;
-    const writableFloor = writable && Number.isFinite(writable.index) ? writable.index + 1 : null;
-    const floorNumbers = [floor.floorNumber, writableFloor]
-      .filter((value) => Number.isFinite(value))
-      .map((value) => Number(value));
-    const now = Date.now();
-    return loadLogs().some((log) => {
-      if (!log || !log.truncateMethod) return false;
-      const method = String(log.truncateMethod);
-      if (!method.includes('已删除') && !method.toLowerCase().includes('deleted')) return false;
-      const logTime = Date.parse(log.time || '');
-      if (Number.isFinite(logTime) && now - logTime > 12 * 60 * 60 * 1000) return false;
-      if (rawMesid != null && String(rawMesid).trim() !== '' && String(log.rawMesid || '').trim() === String(rawMesid).trim()) return true;
-      return floorNumbers.includes(Number(log.floorNumber));
-    });
-  }
-
-  function hasAutoTruncated(message, state, task, writable, detection) {
-    if (state && state.autoTruncateUsed) return true;
-    const keys = getPersistentGuardKeys(getAutoTruncatedKeys(message, task, writable, detection));
-    const scopedKeys = getScopedGuardKeys(keys);
-    const savedKeys = new Set(loadTruncatedGuards());
-    return scopedKeys.some((key) => runtime.autoTruncatedKeys.has(key) || savedKeys.has(key));
-  }
-
   function getFloorInfo(message) {
     const node = message && message.node;
     if (!node) return { floorLabel: '未知楼层', floorNumber: null };
@@ -2029,33 +1863,39 @@
     return `${text.length}:${(hash >>> 0).toString(36)}:${text.slice(-40)}`;
   }
 
+  function findContentCloseInSources(sources) {
+    let sourceKind = '';
+    let closeIndex = -1;
+    for (const source of sources) {
+      const normalized = normalizeTagSource(source.value);
+      const contentClose = findTag(normalized, 'content', 0, true);
+      if (!contentClose) continue;
+      if (!sourceKind) sourceKind = source.kind;
+      if (closeIndex < 0 || contentClose.index < closeIndex) closeIndex = contentClose.index;
+    }
+    return {
+      hasContentClose: closeIndex >= 0,
+      contentCloseIndex: closeIndex,
+      sourceKind,
+    };
+  }
+
   function getThinkingBodyPreview(text, thinking) {
     const start = thinking.index + thinking.length;
     return normalizeTagSource(text.slice(start, start + ABNORMAL_THINKING_OBSERVE_LIMIT));
   }
 
+  function hasFixedAbnormalThinkingOpening(preview) {
+    const compactHead = String(preview || '').replace(/\s+/g, '').slice(0, 180).toLowerCase();
+    return compactHead.includes('我完全遵循pluto系统的要求');
+  }
+
   function classifyThinkingBlock(text, thinking) {
     const preview = getThinkingBodyPreview(text, thinking);
-    const compact = preview.replace(/\s+/g, '');
-    const lower = compact.toLowerCase();
-    const primaryMatches = /pluto/i.test(preview) && /(?:\u7cfb\u7edf|\u8981\u6c42)/.test(preview);
-    const supportMatches = [
-      'user_input',
-      'cot回答',
-      'step0',
-      '输入确认',
-      '能否做到',
-      '中文母语使用者',
-      '优秀创作者',
-      '不再进行任何额外的思考',
-      '自作聪明地预设剧情',
-    ].filter((keyword) => lower.includes(keyword.toLowerCase()));
-    if (primaryMatches) {
+    if (hasFixedAbnormalThinkingOpening(preview)) {
       return {
         kind: 'abnormal',
-        reason: supportMatches.length
-          ? `命中异常开场：PLUTO + ${supportMatches[0]}`
-          : '命中异常开场：PLUTO 固定复盘',
+        reason: '命中固定异常开场：我完全遵循PLUTO系统的要求',
       };
     }
     const close = findTag(text, 'thinking', thinking.index + thinking.length, true);
@@ -2101,10 +1941,18 @@
       const endIndex = close.index + close.length;
       const blockLength = endIndex - thinking.index;
       if (blockLength > 0 && blockLength <= COMPLETION_CLEANUP_MAX_BLOCK_LENGTH) {
+        let cleanupStart = thinking.index;
+        let cleanupEnd = endIndex;
+        while (cleanupStart > contentClose.index + contentClose.length && /\s/.test(source.charAt(cleanupStart - 1))) {
+          cleanupStart -= 1;
+        }
+        while (cleanupEnd < source.length && /\s/.test(source.charAt(cleanupEnd))) {
+          cleanupEnd += 1;
+        }
         ranges.push({
-          start: thinking.index,
-          end: endIndex,
-          text: source.slice(thinking.index, endIndex),
+          start: cleanupStart,
+          end: cleanupEnd,
+          text: source.slice(cleanupStart, cleanupEnd),
           snippet: getSnippetBefore(source, thinking.index),
         });
       }
@@ -2123,6 +1971,7 @@
   function detectDoubleThinking(sources) {
     let sawContentClose = false;
     let contentCloseSourceKind = '';
+    let contentCloseIndex = -1;
     let observingSourceKind = '';
     for (const source of sources) {
       const normalized = normalizeTagSource(source.value);
@@ -2130,6 +1979,7 @@
       if (!contentClose) continue;
       sawContentClose = true;
       if (!contentCloseSourceKind) contentCloseSourceKind = source.kind;
+      if (contentCloseIndex < 0 || contentClose.index < contentCloseIndex) contentCloseIndex = contentClose.index;
       let searchIndex = contentClose.index + contentClose.length;
       while (searchIndex < normalized.length) {
         const thinking = findTag(normalized, 'thinking', searchIndex, false);
@@ -2140,6 +1990,7 @@
             hasContentClose: true,
             trigger: true,
             sourceKind: source.kind,
+            contentCloseIndex: contentClose.index,
             thinkingIndex: thinking.index,
             triggerSignature: getTextSignature(normalized.slice(0, thinking.index)),
             snippet: getSnippetBefore(normalized, thinking.index),
@@ -2156,6 +2007,7 @@
     if (observingSourceKind) {
       return {
         hasContentClose: true,
+        contentCloseIndex,
         trigger: false,
         sourceKind: observingSourceKind,
         observing: true,
@@ -2163,6 +2015,7 @@
     }
     return {
       hasContentClose: sawContentClose,
+      contentCloseIndex,
       trigger: false,
       sourceKind: contentCloseSourceKind,
     };
@@ -2173,14 +2026,13 @@
     if (!message) return;
     const key = getMessageKey(message);
     const sources = getMessageSources(message);
-    const detection = detectDoubleThinking(sources);
+    const contentCloseState = findContentCloseInSources(sources);
     runtime.states.set(key, {
       lastLength: getMaxSourceLength(sources),
-      contentClosed: detection.hasContentClose,
+      contentClosed: contentCloseState.hasContentClose,
+      contentCloseIndex: contentCloseState.contentCloseIndex,
       stopped: false,
       autoContinueUsed: false,
-      autoTruncateUsed: false,
-      handled: hasHandled(message),
       seenGenerating: false,
       cleanupDone: false,
       cleanupScheduled: false,
@@ -2212,8 +2064,6 @@
     setGuardStatus(messageText, stopResult.ok ? 'warning' : 'error');
     notify(stopResult.ok ? 'warning' : 'error', messageText);
     if (stopResult.ok) {
-      state.handled = true;
-      markHandled(message, null, null, detection);
       schedulePostStopProcessing(message, state, detection, floor, logId, settings);
     }
   }
@@ -2238,7 +2088,6 @@
       const sources = getMessageSources(message);
       const maxLength = getMaxSourceLength(sources);
       const generationActive = isGenerationActive() === true;
-      const detection = detectDoubleThinking(sources);
       let state = runtime.states.get(key);
 
       if (state && state.activeTaskId && runtime.activeTasks.has(state.activeTaskId)) {
@@ -2250,17 +2099,29 @@
         state = null;
       }
 
-      const alreadyAutoTruncated = hasAutoTruncated(message, state, null, null, detection);
-      const alreadyHandled = hasHandled(message, state, null, null, detection);
+      const contentCloseState = state && state.contentClosed
+        ? {
+          hasContentClose: true,
+          contentCloseIndex: Number.isFinite(state.contentCloseIndex) ? state.contentCloseIndex : -1,
+          sourceKind: '',
+        }
+        : findContentCloseInSources(sources);
+      const detection = generationActive && contentCloseState.hasContentClose
+        ? detectDoubleThinking(sources)
+        : {
+          hasContentClose: contentCloseState.hasContentClose,
+          contentCloseIndex: contentCloseState.contentCloseIndex,
+          trigger: false,
+          sourceKind: contentCloseState.sourceKind,
+        };
 
       if (!generationActive) {
         const nextState = {
           lastLength: maxLength,
           contentClosed: detection.hasContentClose,
+          contentCloseIndex: detection.contentCloseIndex,
           stopped: false,
           autoContinueUsed: state && state.autoContinueUsed || false,
-          autoTruncateUsed: alreadyAutoTruncated,
-          handled: alreadyHandled,
           seenGenerating: state && state.seenGenerating || false,
           cleanupDone: state && state.cleanupDone || false,
           cleanupScheduled: state && state.cleanupScheduled || false,
@@ -2277,10 +2138,9 @@
         state = {
           lastLength: maxLength,
           contentClosed: detection.hasContentClose,
+          contentCloseIndex: detection.contentCloseIndex,
           stopped: false,
           autoContinueUsed: false,
-          autoTruncateUsed: alreadyAutoTruncated,
-          handled: alreadyHandled,
           seenGenerating: true,
           cleanupDone: false,
           cleanupScheduled: false,
@@ -2288,10 +2148,6 @@
           baselineOnly: false,
         };
         runtime.states.set(key, state);
-        if (detection.trigger && (hasHandled(message, state, null, null, detection) || hasAutoTruncated(message, state, null, null, detection))) {
-          setGuardStatus('本楼已经处理过一次，忽略后续同楼 <thinking>，避免误删续写内容。', 'warning');
-          return;
-        }
         if (detection.trigger) {
           handleTrigger(message, state, detection);
           return;
@@ -2310,12 +2166,9 @@
 
       if (detection.hasContentClose && !state.contentClosed) {
         state.contentClosed = true;
+        state.contentCloseIndex = detection.contentCloseIndex;
         const floor = getFloorInfo(message);
         setGuardStatus(`已看到 ${floor.floorLabel} 的 </content>，开始警戒后续 <thinking>。`, 'muted');
-      }
-      if (detection.trigger && (hasHandled(message, state, null, null, detection) || hasAutoTruncated(message, state, null, null, detection))) {
-        setGuardStatus('本楼已经处理过一次，忽略后续同楼 <thinking>，避免误删续写内容。', 'warning');
-        return;
       }
       if (detection.trigger) {
         handleTrigger(message, state, detection);
