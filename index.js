@@ -1,14 +1,14 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.12
+// version: v0.0.13
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.12';
+  const SCRIPT_VERSION = 'v0.0.13';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -24,12 +24,14 @@
   const MAX_BACKUP_DAYS = 14;
   const ABNORMAL_THINKING_OBSERVE_LIMIT = 500;
   const COMPLETION_CLEANUP_MAX_BLOCK_LENGTH = 2000;
+  const SMALL_THEATER_VAULT_MAX_BLOCKS = 8;
 
   const DEFAULT_SETTINGS = {
     enabled: true,
     autoTruncate: false,
     autoContinue: false,
     cleanupContinuationThinking: true,
+    smallTheaterVault: false,
     stopDelaySeconds: 30,
     continueDelaySeconds: 30,
     cleanupDelaySeconds: 5,
@@ -240,6 +242,7 @@
       autoTruncate: merged.autoTruncate === true,
       autoContinue: merged.autoContinue === true,
       cleanupContinuationThinking: merged.cleanupContinuationThinking !== false,
+      smallTheaterVault: merged.smallTheaterVault === true,
       stopDelaySeconds: normalizeDelaySeconds(merged.stopDelaySeconds, DEFAULT_SETTINGS.stopDelaySeconds),
       continueDelaySeconds: normalizeDelaySeconds(merged.continueDelaySeconds, DEFAULT_SETTINGS.continueDelaySeconds),
       cleanupDelaySeconds: normalizeDelaySeconds(merged.cleanupDelaySeconds, DEFAULT_SETTINGS.cleanupDelaySeconds),
@@ -1029,6 +1032,7 @@
         <div class="th-rdt-log-method">截断：${escapeHtml(log.truncateMethod || log.truncateError || log.truncateStatus || '未执行')}</div>
         <div class="th-rdt-log-method">续写：${escapeHtml(log.continueMethod || log.continueError || log.continueStatus || '未执行')}</div>
         ${log.cleanupMethod || log.cleanupError || log.cleanupStatus ? `<div class="th-rdt-log-method">收笔清理：${escapeHtml(log.cleanupMethod || log.cleanupError || log.cleanupStatus)}</div>` : ''}
+        ${log.theaterVaultMethod || log.theaterVaultStatus ? `<div class="th-rdt-log-method">保险箱：${escapeHtml(log.theaterVaultMethod || log.theaterVaultStatus)}</div>` : ''}
       </div>
     `).join('');
   }
@@ -1082,6 +1086,14 @@
               <span>${settings.cleanupContinuationThinking ? '收笔后清理续写 thinking 已开启' : '收笔后清理续写 thinking 已关闭'}</span>
             </label>
           </div>
+          <div class="th-rdt-row" style="margin-top:10px;">
+            <label class="th-rdt-switch">
+              <input type="checkbox" data-field="smallTheaterVault"${settings.smallTheaterVault ? ' checked' : ''}>
+              <span class="th-rdt-switch-track" aria-hidden="true"></span>
+              <span>${settings.smallTheaterVault ? '小剧场保险箱已开启' : '小剧场保险箱已关闭'}</span>
+            </label>
+          </div>
+          <div class="th-rdt-hint">开启后会在删除异常 thinking 前保存已闭合的小剧场，并在收笔前补回。</div>
           <div class="th-rdt-grid">
             <label class="th-rdt-field">
               <span>停止后等待秒数</span>
@@ -1132,7 +1144,7 @@
       const field = event.target && event.target.dataset ? event.target.dataset.field : '';
       if (!field) return;
       const patch = {};
-      if (['enabled', 'autoTruncate', 'autoContinue', 'cleanupContinuationThinking'].includes(field)) {
+      if (['enabled', 'autoTruncate', 'autoContinue', 'cleanupContinuationThinking', 'smallTheaterVault'].includes(field)) {
         patch[field] = Boolean(event.target.checked);
       } else if (['stopDelaySeconds', 'continueDelaySeconds', 'cleanupDelaySeconds'].includes(field)) {
         patch[field] = normalizeDelaySeconds(event.target.value, DEFAULT_SETTINGS[field]);
@@ -1447,6 +1459,8 @@
       stopDelaySeconds: settings.stopDelaySeconds,
       continueDelaySeconds: settings.continueDelaySeconds,
       autoContinue: settings.autoContinue && !state.autoContinueUsed,
+      smallTheaterVault: settings.smallTheaterVault === true,
+      smallTheaterBlocks: [],
     };
     runtime.activeTasks.set(task.id, task);
     state.activeTaskId = task.id;
@@ -1538,6 +1552,28 @@
     if (truncated === rawText) {
       cancelTask(task, '截断点无效，取消自动截断');
       return;
+    }
+    const theaterBlocks = task.smallTheaterVault
+      ? findCompletedSmallTheaterBlocks(rawText, triggerIndex)
+      : [];
+    if (task.smallTheaterVault) {
+      task.smallTheaterBlocks = theaterBlocks.map((block) => ({
+        text: block.text,
+        snippet: block.snippet || '',
+      }));
+      if (state) {
+        state.smallTheaterVault = {
+          blocks: task.smallTheaterBlocks,
+          inserted: false,
+          savedAt: new Date().toISOString(),
+        };
+      }
+      updateLog(task.logId, {
+        theaterVaultStatus: theaterBlocks.length
+          ? `已保存 ${theaterBlocks.length} 个已闭合小剧场，等待收笔前补回`
+          : '异常前没有完整闭合小剧场，无需保存',
+        theaterVaultSavedCount: theaterBlocks.length,
+      });
     }
     const removedText = rawText.slice(detection.thinkingIndex);
     const backupResult = saveDeletedBackup({
@@ -1650,31 +1686,46 @@
   }
 
   function scheduleCompletionCleanup(message, state, settings) {
-    if (!settings.cleanupContinuationThinking || !message || !state || state.cleanupDone || state.cleanupScheduled) return;
+    if (!message || !state || state.cleanupDone || state.cleanupScheduled) return;
+    const vaultBlocks = settings.smallTheaterVault ? getVaultBlocksFromState(state) : [];
+    if (!settings.cleanupContinuationThinking && !vaultBlocks.length) return;
     const key = getMessageKey(message);
     const writable = getWritableMessageRecord(message);
     if (!writable.ok) return;
     const rawText = getRecordText(writable.record);
     if (!hasCompletionMarker(rawText)) return;
-    const ranges = findContinuationThinkingCleanupRanges(rawText);
-    if (!ranges.length) {
+    const ranges = settings.cleanupContinuationThinking ? findContinuationThinkingCleanupRanges(rawText) : [];
+    if (!ranges.length && !vaultBlocks.length) {
       state.cleanupDone = true;
+      if (state.lastFlowLogId) {
+        updateLog(state.lastFlowLogId, {
+          flowStatus: '已收笔；未发现续写 thinking，也没有可补回的小剧场',
+          cleanupStatus: '未发现可删除的续写 thinking',
+          theaterVaultStatus: '没有可补回的小剧场',
+        });
+      }
       return;
     }
     state.cleanupScheduled = true;
     if (state.lastFlowLogId) {
+      const actions = [];
+      if (ranges.length) actions.push('删除续写 thinking');
+      if (vaultBlocks.length) actions.push(`补回 ${vaultBlocks.length} 个小剧场`);
       updateLog(state.lastFlowLogId, {
-        flowStatus: `检测到此处收笔；等待 ${settings.cleanupDelaySeconds} 秒后删除续写 thinking`,
-        cleanupStatus: `等待 ${settings.cleanupDelaySeconds} 秒后删除续写 thinking`,
+        flowStatus: `检测到此处收笔；等待 ${settings.cleanupDelaySeconds} 秒后${actions.join('并')}`,
+        cleanupStatus: ranges.length ? `等待 ${settings.cleanupDelaySeconds} 秒后删除续写 thinking` : '未发现可删除的续写 thinking',
+        theaterVaultStatus: vaultBlocks.length ? `等待收笔处理后补回 ${vaultBlocks.length} 个小剧场` : '没有可补回的小剧场',
       });
     }
-    setGuardStatus(`检测到此处收笔，等待 ${settings.cleanupDelaySeconds} 秒后清理续写 thinking。`, 'muted');
+    setGuardStatus(`检测到此处收笔，等待 ${settings.cleanupDelaySeconds} 秒后执行收尾处理。`, 'muted');
     scheduleAction(() => {
       runCompletionCleanupTask({
         key,
         rawMesid: String(writable.index),
         floorLabel: getFloorInfo(message).floorLabel,
         logId: state.lastFlowLogId || '',
+        cleanupContinuationThinking: settings.cleanupContinuationThinking,
+        smallTheaterVault: settings.smallTheaterVault,
         cleanupDelaySeconds: settings.cleanupDelaySeconds,
       }).catch((error) => {
         const currentState = runtime.states.get(key);
@@ -1703,43 +1754,61 @@
     if (task.rawMesid && String(writable.index) !== String(task.rawMesid)) return;
     const rawText = getRecordText(writable.record);
     if (!hasCompletionMarker(rawText)) return;
-    const ranges = findContinuationThinkingCleanupRanges(rawText);
-    if (!ranges.length) {
+    const ranges = task.cleanupContinuationThinking ? findContinuationThinkingCleanupRanges(rawText) : [];
+    const vaultBlocks = task.smallTheaterVault ? getVaultBlocksFromState(state) : [];
+    if (!ranges.length && !vaultBlocks.length) {
       if (state) state.cleanupDone = true;
       if (task.logId) {
         updateLog(task.logId, {
-          flowStatus: '收笔后未发现可删除的续写 thinking',
+          flowStatus: '已收笔；未发现续写 thinking，也没有可补回的小剧场',
           cleanupStatus: '未发现可删除的续写 thinking',
+          theaterVaultStatus: '没有可补回的小剧场',
         });
       }
       return;
     }
-    const removedText = ranges.map((range, index) => `#${index + 1}\n${range.text}`).join('\n\n---\n\n');
-    const backupResult = saveDeletedBackup({
-      floorLabel: task.floorLabel,
-      floorNumber: Number.isFinite(writable.index) ? writable.index + 1 : null,
-      rawMesid: String(writable.index),
-      snippet: ranges[0].snippet || '',
-      removedCount: removedText.length,
-      text: removedText,
-      reason: 'completion-cleanup',
-    });
-    if (!backupResult.ok) {
-      if (task.logId) {
-        updateLog(task.logId, {
-          flowStatus: `删除续写 thinking 已取消：备份失败`,
-          cleanupError: `备份失败，未删除续写 thinking：${backupResult.error}`,
-        });
+    let removedText = '';
+    let backupResult = { ok: true, dateKey: '' };
+    if (ranges.length) {
+      removedText = ranges.map((range, index) => `#${index + 1}\n${range.text}`).join('\n\n---\n\n');
+      backupResult = saveDeletedBackup({
+        floorLabel: task.floorLabel,
+        floorNumber: Number.isFinite(writable.index) ? writable.index + 1 : null,
+        rawMesid: String(writable.index),
+        snippet: ranges[0].snippet || '',
+        removedCount: removedText.length,
+        text: removedText,
+        reason: 'completion-cleanup',
+      });
+      if (!backupResult.ok) {
+        if (task.logId) {
+          updateLog(task.logId, {
+            flowStatus: `删除续写 thinking 已取消：备份失败`,
+            cleanupError: `备份失败，未删除续写 thinking：${backupResult.error}`,
+          });
+        }
+        setGuardStatus(`保存续写 thinking 备份失败，已取消清理：${backupResult.error}`, 'error');
+        notify('error', `保存续写 thinking 备份失败，未删除：${backupResult.error}`);
+        return;
       }
-      setGuardStatus(`保存续写 thinking 备份失败，已取消清理：${backupResult.error}`, 'error');
-      notify('error', `保存续写 thinking 备份失败，未删除：${backupResult.error}`);
-      return;
     }
     let cleaned = rawText;
     ranges.slice().reverse().forEach((range) => {
       cleaned = cleaned.slice(0, range.start) + cleaned.slice(range.end);
     });
-    if (cleaned === rawText) return;
+    const insertResult = insertSmallTheaterBlocksBeforeCompletion(cleaned, vaultBlocks);
+    if (insertResult.changed) cleaned = insertResult.text;
+    if (cleaned === rawText) {
+      if (state) state.cleanupDone = true;
+      if (task.logId) {
+        updateLog(task.logId, {
+          flowStatus: '收尾处理完成；没有需要改动的内容',
+          cleanupStatus: ranges.length ? '续写 thinking 清理未产生改动' : '未发现可删除的续写 thinking',
+          theaterVaultStatus: vaultBlocks.length ? '小剧场补回未产生改动' : '没有可补回的小剧场',
+        });
+      }
+      return;
+    }
     applyRecordText(writable.record, cleaned);
     await refreshMessageBlock(writable);
     await saveChatSafely(writable.context);
@@ -1757,16 +1826,26 @@
     if (state) {
       state.cleanupDone = true;
       state.lastLength = cleaned.length;
+      if (state.smallTheaterVault && insertResult.insertedCount) {
+        state.smallTheaterVault.inserted = true;
+        state.smallTheaterVault.insertedAt = new Date().toISOString();
+      }
     }
+    const flowParts = [];
+    if (ranges.length) flowParts.push(`已删除续写 thinking，共 ${removedText.length} 字符`);
+    if (insertResult.insertedCount) flowParts.push(`已补回 ${insertResult.insertedCount} 个小剧场`);
+    if (!flowParts.length) flowParts.push('收尾处理完成');
     const cleanupPatch = {
       floorLabel: task.floorLabel,
       floorNumber: Number.isFinite(writable.index) ? writable.index + 1 : null,
       rawMesid: String(writable.index),
-      snippet: ranges[0].snippet || '',
-      flowStatus: `收笔后已删除续写 thinking，共 ${removedText.length} 字符`,
-      cleanupMethod: `已删除续写 thinking ${ranges.length} 段，共 ${removedText.length} 字符`,
-      cleanupStatus: '',
-      cleanupBackupDate: backupResult.dateKey,
+      snippet: ranges[0] && ranges[0].snippet || vaultBlocks[0] && vaultBlocks[0].snippet || '',
+      flowStatus: `收笔后${flowParts.join('；')}`,
+      cleanupMethod: ranges.length ? `已删除续写 thinking ${ranges.length} 段，共 ${removedText.length} 字符` : '',
+      cleanupStatus: ranges.length ? '' : '未发现可删除的续写 thinking',
+      theaterVaultMethod: insertResult.insertedCount ? `已补回 ${insertResult.insertedCount} 个小剧场，共 ${insertResult.insertedLength} 字符` : '',
+      theaterVaultStatus: insertResult.insertedCount ? '' : (vaultBlocks.length ? '小剧场补回未产生改动' : '没有可补回的小剧场'),
+      cleanupBackupDate: backupResult.dateKey || '',
       cleanupAt: new Date().toISOString(),
     };
     if (task.logId) {
@@ -1778,8 +1857,8 @@
         backupDate: backupResult.dateKey,
       }, cleanupPatch));
     }
-    setGuardStatus(`已在收笔后清理 ${task.floorLabel} 的 ${ranges.length} 段续写 thinking。`, 'warning');
-    notify('success', `已删除续写 thinking：${task.floorLabel}，共 ${removedText.length} 字符`);
+    setGuardStatus(`收尾处理完成：${task.floorLabel}，${flowParts.join('；')}。`, 'warning');
+    notify('success', `收尾处理完成：${task.floorLabel}，${flowParts.join('；')}`);
   }
 
   function getChatContainer() {
@@ -2045,6 +2124,73 @@
     return /此处\s*收笔/.test(tail);
   }
 
+  function findCompletionMarkerStart(text) {
+    const source = String(text || '');
+    const markerMatch = /此处\s*收笔/.exec(source);
+    if (!markerMatch) return -1;
+    const markerIndex = markerMatch.index;
+    const before = source.slice(Math.max(0, markerIndex - 800), markerIndex);
+    const paragraphOffset = before.lastIndexOf('<p');
+    if (paragraphOffset >= 0) {
+      return Math.max(0, markerIndex - before.length + paragraphOffset);
+    }
+    return markerIndex;
+  }
+
+  function findCompletedSmallTheaterBlocks(text, endBeforeIndex) {
+    const source = String(text || '');
+    const limit = Math.max(0, Math.min(Number(endBeforeIndex) || 0, source.length));
+    const blocks = [];
+    let searchIndex = 0;
+    while (searchIndex < limit && blocks.length < SMALL_THEATER_VAULT_MAX_BLOCKS) {
+      const open = findTag(source, 'Episode', searchIndex, false);
+      if (!open || open.index >= limit) break;
+      const close = findTag(source, 'Episode', open.index + open.length, true);
+      if (!close) break;
+      const blockEnd = close.index + close.length;
+      if (blockEnd > limit) break;
+      const blockText = source.slice(open.index, blockEnd).trim();
+      if (findTag(blockText, 'small_theater', 0, false)) {
+        blocks.push({
+          start: open.index,
+          end: blockEnd,
+          text: blockText,
+          snippet: getSnippetBefore(source, open.index),
+        });
+      }
+      searchIndex = blockEnd;
+    }
+    return blocks;
+  }
+
+  function getVaultBlocksFromState(state) {
+    const vault = state && state.smallTheaterVault;
+    if (!vault || vault.inserted || !Array.isArray(vault.blocks)) return [];
+    return vault.blocks.filter((block) => block && typeof block.text === 'string' && block.text.trim());
+  }
+
+  function insertSmallTheaterBlocksBeforeCompletion(text, blocks) {
+    const source = String(text || '');
+    const insertIndex = findCompletionMarkerStart(source);
+    const validBlocks = (blocks || []).filter((block) => block && typeof block.text === 'string' && block.text.trim());
+    if (insertIndex < 0 || !validBlocks.length) {
+      return { changed: false, text: source, insertIndex, insertedCount: 0, insertedLength: 0 };
+    }
+    const insertion = validBlocks.map((block) => block.text.trim()).join('\n\n');
+    const before = source.slice(0, insertIndex).replace(/\s*$/, '');
+    const after = source.slice(insertIndex).replace(/^\s*/, '');
+    const joiner = before ? '\n\n' : '';
+    const tailJoiner = after ? '\n\n' : '';
+    const nextText = `${before}${joiner}${insertion}${tailJoiner}${after}`;
+    return {
+      changed: nextText !== source,
+      text: nextText,
+      insertIndex,
+      insertedCount: validBlocks.length,
+      insertedLength: insertion.length,
+    };
+  }
+
   function findContinuationThinkingCleanupRanges(text) {
     const source = String(text || '').replace(/[\u200B-\u200D\uFEFF]/g, '');
     const contentClose = findTag(source, 'content', 0, true);
@@ -2160,6 +2306,7 @@
       cleanupDone: false,
       cleanupScheduled: false,
       lastFlowLogId: '',
+      smallTheaterVault: null,
       createdAt: Date.now(),
     });
   }
@@ -2257,6 +2404,7 @@
           cleanupDone: state && state.cleanupDone || false,
           cleanupScheduled: state && state.cleanupScheduled || false,
           lastFlowLogId: state && state.lastFlowLogId || '',
+          smallTheaterVault: state && state.smallTheaterVault || null,
           createdAt: state && state.createdAt || Date.now(),
           baselineOnly: true,
         };
@@ -2277,6 +2425,7 @@
           cleanupDone: false,
           cleanupScheduled: false,
           lastFlowLogId: '',
+          smallTheaterVault: null,
           createdAt: Date.now(),
           baselineOnly: false,
         };
