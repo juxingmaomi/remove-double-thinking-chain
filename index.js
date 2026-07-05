@@ -1,14 +1,14 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.13
+// version: v0.0.14
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.13';
+  const SCRIPT_VERSION = 'v0.0.14';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -25,6 +25,7 @@
   const ABNORMAL_THINKING_OBSERVE_LIMIT = 500;
   const COMPLETION_CLEANUP_MAX_BLOCK_LENGTH = 2000;
   const SMALL_THEATER_VAULT_MAX_BLOCKS = 8;
+  const SMALL_THEATER_VAULT_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 
   const DEFAULT_SETTINGS = {
     enabled: true,
@@ -57,6 +58,7 @@
     observedTarget: null,
     checking: false,
     activeTasks: new Map(),
+    smallTheaterVaults: new Map(),
   };
 
   function getHostWindow() {
@@ -1561,13 +1563,18 @@
         text: block.text,
         snippet: block.snippet || '',
       }));
+      const vault = {
+        blocks: task.smallTheaterBlocks,
+        inserted: false,
+        savedAt: new Date().toISOString(),
+        logId: task.logId || '',
+        floorLabel: task.floorLabel || '',
+        rawMesid: task.rawMesid || '',
+      };
       if (state) {
-        state.smallTheaterVault = {
-          blocks: task.smallTheaterBlocks,
-          inserted: false,
-          savedAt: new Date().toISOString(),
-        };
+        state.smallTheaterVault = vault;
       }
+      saveSmallTheaterVault(latest, task, writable, vault);
       updateLog(task.logId, {
         theaterVaultStatus: theaterBlocks.length
           ? `已保存 ${theaterBlocks.length} 个已闭合小剧场，等待收笔前补回`
@@ -1687,11 +1694,14 @@
 
   function scheduleCompletionCleanup(message, state, settings) {
     if (!message || !state || state.cleanupDone || state.cleanupScheduled) return;
-    const vaultBlocks = settings.smallTheaterVault ? getVaultBlocksFromState(state) : [];
-    if (!settings.cleanupContinuationThinking && !vaultBlocks.length) return;
     const key = getMessageKey(message);
     const writable = getWritableMessageRecord(message);
     if (!writable.ok) return;
+    const fallbackVault = settings.smallTheaterVault ? lookupSmallTheaterVault(message, null, writable) : null;
+    if (fallbackVault && !state.smallTheaterVault) state.smallTheaterVault = fallbackVault;
+    if (fallbackVault && !state.lastFlowLogId && fallbackVault.logId) state.lastFlowLogId = fallbackVault.logId;
+    const vaultBlocks = settings.smallTheaterVault ? getVaultBlocksFromState(state) : [];
+    if (!settings.cleanupContinuationThinking && !vaultBlocks.length) return;
     const rawText = getRecordText(writable.record);
     if (!hasCompletionMarker(rawText)) return;
     const ranges = settings.cleanupContinuationThinking ? findContinuationThinkingCleanupRanges(rawText) : [];
@@ -1752,10 +1762,15 @@
     const writable = getWritableMessageRecord(latest);
     if (!writable.ok) return;
     if (task.rawMesid && String(writable.index) !== String(task.rawMesid)) return;
+    const fallbackVault = task.smallTheaterVault ? lookupSmallTheaterVault(latest, task, writable) : null;
+    if (fallbackVault && state && !state.smallTheaterVault) state.smallTheaterVault = fallbackVault;
+    if (fallbackVault && !task.logId && fallbackVault.logId) task.logId = fallbackVault.logId;
     const rawText = getRecordText(writable.record);
     if (!hasCompletionMarker(rawText)) return;
     const ranges = task.cleanupContinuationThinking ? findContinuationThinkingCleanupRanges(rawText) : [];
-    const vaultBlocks = task.smallTheaterVault ? getVaultBlocksFromState(state) : [];
+    const stateVaultBlocks = task.smallTheaterVault ? getVaultBlocksFromState(state) : [];
+    const fallbackVaultBlocks = task.smallTheaterVault ? getVaultBlocksFromState({ smallTheaterVault: fallbackVault }) : [];
+    const vaultBlocks = stateVaultBlocks.length ? stateVaultBlocks : fallbackVaultBlocks;
     if (!ranges.length && !vaultBlocks.length) {
       if (state) state.cleanupDone = true;
       if (task.logId) {
@@ -1829,6 +1844,9 @@
       if (state.smallTheaterVault && insertResult.insertedCount) {
         state.smallTheaterVault.inserted = true;
         state.smallTheaterVault.insertedAt = new Date().toISOString();
+      }
+      if (fallbackVault && insertResult.insertedCount) {
+        markSmallTheaterVaultInserted(latest, task, writable, fallbackVault);
       }
     }
     const flowParts = [];
@@ -1967,6 +1985,77 @@
       };
     }
     return { floorLabel: '未知楼层', floorNumber: null };
+  }
+
+  function getSmallTheaterVaultKeys(message, task, writable) {
+    const keys = new Set();
+    const scope = getGuardScope();
+    const add = (value) => {
+      const text = String(value == null ? '' : value).trim();
+      if (text) keys.add(`scope:${scope}::${text}`);
+    };
+    if (message) {
+      const messageKey = getMessageKey(message);
+      if (messageKey && messageKey !== 'none') keys.add(messageKey);
+      const floor = getFloorInfo(message);
+      if (floor.rawMesid != null && String(floor.rawMesid).trim() !== '') add(`mesid:${String(floor.rawMesid).trim()}`);
+      if (Number.isFinite(floor.floorNumber)) add(`floor:${floor.floorNumber}`);
+      const numericMesid = getNumericMessageId(message);
+      if (Number.isFinite(numericMesid)) {
+        add(`mesid:${numericMesid}`);
+        add(`floor:${numericMesid + 1}`);
+      }
+    }
+    if (task) {
+      if (task.key) keys.add(task.key);
+      if (task.rawMesid != null && String(task.rawMesid).trim() !== '') {
+        const rawMesid = String(task.rawMesid).trim();
+        add(`mesid:${rawMesid}`);
+        const numericMesid = Number(rawMesid);
+        if (Number.isFinite(numericMesid)) add(`floor:${numericMesid + 1}`);
+      }
+    }
+    if (writable && Number.isFinite(writable.index)) {
+      add(`mesid:${writable.index}`);
+      add(`floor:${writable.index + 1}`);
+    }
+    return Array.from(keys);
+  }
+
+  function cleanupExpiredSmallTheaterVaults() {
+    const now = Date.now();
+    runtime.smallTheaterVaults.forEach((vault, key) => {
+      const savedAt = Date.parse(vault && vault.savedAt || '');
+      if (!Number.isFinite(savedAt) || now - savedAt > SMALL_THEATER_VAULT_MAX_AGE_MS) {
+        runtime.smallTheaterVaults.delete(key);
+      }
+    });
+  }
+
+  function saveSmallTheaterVault(message, task, writable, vault) {
+    cleanupExpiredSmallTheaterVaults();
+    const nextVault = Object.assign({}, vault || {});
+    getSmallTheaterVaultKeys(message, task, writable).forEach((key) => {
+      runtime.smallTheaterVaults.set(key, nextVault);
+    });
+    return nextVault;
+  }
+
+  function lookupSmallTheaterVault(message, task, writable) {
+    cleanupExpiredSmallTheaterVaults();
+    const keys = getSmallTheaterVaultKeys(message, task, writable);
+    for (const key of keys) {
+      const vault = runtime.smallTheaterVaults.get(key);
+      if (vault) return vault;
+    }
+    return null;
+  }
+
+  function markSmallTheaterVaultInserted(message, task, writable, vault) {
+    if (!vault) return;
+    vault.inserted = true;
+    vault.insertedAt = new Date().toISOString();
+    saveSmallTheaterVault(message, task, writable, vault);
   }
 
   function getContextMessageText(message) {

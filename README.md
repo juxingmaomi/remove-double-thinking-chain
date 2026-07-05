@@ -32,7 +32,7 @@ TavernHelper / SillyTavern 小插件。它会在当前回复的 `</content>` 已
 
 1. 创建公开 GitHub 仓库，例如 `juxingmaomi/remove-double-thinking-chain`。
 2. 上传 `index.js` 到仓库根目录。
-3. 创建 tag / release：`v0.0.13`。
+3. 创建 tag / release：`v0.0.14`。
 4. 在 TavernHelper 中粘贴 `tavern-helper-loader.template.js` 的内容。
 5. 以后发布新版本后，只需要把 loader 里的 `VERSION` 改成新 tag，例如 `v0.0.2`。
 
@@ -43,7 +43,7 @@ TavernHelper / SillyTavern 小插件。它会在当前回复的 `</content>` 已
 ```js
 (async () => {
   const REPO = 'juxingmaomi/remove-double-thinking-chain';
-  const VERSION = 'v0.0.13';
+  const VERSION = 'v0.0.14';
   const URL = `https://gcore.jsdelivr.net/gh/${REPO}@${VERSION}/index.js`;
 
   const loaderState = {
@@ -92,7 +92,7 @@ TavernHelper / SillyTavern 小插件。它会在当前回复的 `</content>` 已
 当前固定版本入口：
 
 ```js
-https://gcore.jsdelivr.net/gh/juxingmaomi/remove-double-thinking-chain@v0.0.13/index.js
+https://gcore.jsdelivr.net/gh/juxingmaomi/remove-double-thinking-chain@v0.0.14/index.js
 ```
 
 如果仓库名不同，修改 loader 里的 `REPO` 即可。
