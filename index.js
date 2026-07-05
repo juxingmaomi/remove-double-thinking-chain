@@ -1,14 +1,14 @@
 // == TavernHelper Script ==
 // name: 去除双思维链
 // author: Codex
-// version: v0.0.14
+// version: v0.0.15
 // description: 在正文 content 闭合后检测到新的 <thinking> 时自动停止当前输出，并记录触发日志。
 
 (function () {
   'use strict';
 
   const SCRIPT_NAME = '去除双思维链';
-  const SCRIPT_VERSION = 'v0.0.14';
+  const SCRIPT_VERSION = 'v0.0.15';
   const BUTTON_NAME = '去双思维链';
   const GLOBAL_INSTANCE_KEY = '__th_remove_double_thinking_chain_instance_v1__';
   const INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -39,6 +39,7 @@
   };
 
   let floatingButtonPosition = null;
+  let floatingPanelPosition = null;
   let bodyRepairObserver = null;
   let bodyRepairTimer = null;
   let floatingGuardTimers = [];
@@ -546,6 +547,7 @@
         padding: 14px;
         border-bottom: 1px solid rgba(130, 150, 165, 0.2);
         background: #111820;
+        cursor: move;
       }
       .th-rdt-title {
         font-size: 15px;
@@ -853,6 +855,50 @@
     button.style.bottom = 'auto';
   }
 
+  function resetPanelPosition(panel) {
+    if (!panel) return;
+    panel.style.left = '';
+    panel.style.top = '';
+    panel.style.right = '';
+    panel.style.bottom = '';
+  }
+
+  function applyPanelPosition(panel) {
+    if (!panel || panel.dataset.open !== 'true') return;
+    const viewport = getViewportSize();
+    if (viewport.width <= 820) {
+      resetPanelPosition(panel);
+      return;
+    }
+    const margin = 12;
+    const panelWidth = panel.offsetWidth || Math.min(380, Math.max(240, viewport.width - 24));
+    const panelHeight = panel.offsetHeight || Math.min(640, Math.max(240, viewport.height - 88));
+    let left = floatingPanelPosition && Number.isFinite(floatingPanelPosition.left) ? floatingPanelPosition.left : null;
+    let top = floatingPanelPosition && Number.isFinite(floatingPanelPosition.top) ? floatingPanelPosition.top : null;
+    if (left == null || top == null) {
+      const button = getHostDocument().getElementById(FLOATING_BUTTON_ID);
+      const rect = button && button.getBoundingClientRect();
+      if (!rect || !rect.width || !rect.height) {
+        resetPanelPosition(panel);
+        return;
+      }
+      left = rect.right - panelWidth;
+      top = rect.top - panelHeight - 8;
+      if (top < margin) top = rect.bottom + 8;
+    }
+    left = Math.min(Math.max(margin, left), Math.max(margin, viewport.width - panelWidth - margin));
+    top = Math.min(Math.max(margin, top), Math.max(margin, viewport.height - panelHeight - margin));
+    panel.style.left = `${left}px`;
+    panel.style.top = `${top}px`;
+    panel.style.right = 'auto';
+    panel.style.bottom = 'auto';
+  }
+
+  function syncOpenPanelPosition() {
+    const panel = getHostDocument().getElementById(PANEL_ID);
+    if (panel && panel.dataset.open === 'true') applyPanelPosition(panel);
+  }
+
   function ensureFloatingButtonInViewport(button) {
     if (!button || button.style.display === 'none' || !button.isConnected) return;
     const viewport = getViewportSize();
@@ -861,10 +907,12 @@
     const outside = rect.right < 8 || rect.bottom < 8 || rect.left > viewport.width - 8 || rect.top > viewport.height - 8;
     if (!outside) return;
     floatingButtonPosition = null;
+    floatingPanelPosition = null;
     button.style.left = '';
     button.style.top = '';
     button.style.right = '';
     button.style.bottom = '';
+    syncOpenPanelPosition();
   }
 
   function bindFloatingButtonDrag(button) {
@@ -906,6 +954,8 @@
       button.style.left = `${left}px`;
       button.style.top = `${top}px`;
       floatingButtonPosition = { left, top };
+      floatingPanelPosition = null;
+      syncOpenPanelPosition();
     };
     const finish = (event) => {
       if (!active) return;
@@ -978,6 +1028,75 @@
         event.stopPropagation();
       }
     }, true);
+  }
+
+  function bindPanelDrag(panel) {
+    if (!panel || panel.dataset.thRemoveDoubleThinkingPanelDragBound === 'true') return;
+    panel.dataset.thRemoveDoubleThinkingPanelDragBound = 'true';
+    let active = false;
+    let pointerId = null;
+    let startX = 0;
+    let startY = 0;
+    let startLeft = 0;
+    let startTop = 0;
+    const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+    const canDragFromTarget = (target) => {
+      if (!target || getViewportSize().width <= 820) return false;
+      const header = target.closest && target.closest('.th-rdt-head');
+      if (!header || !panel.contains(header)) return false;
+      return !target.closest('button, input, textarea, select, a, label');
+    };
+    const begin = (clientX, clientY, id) => {
+      const rect = panel.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      active = true;
+      pointerId = id == null ? null : id;
+      startX = clientX;
+      startY = clientY;
+      startLeft = rect.left;
+      startTop = rect.top;
+      panel.style.left = `${rect.left}px`;
+      panel.style.top = `${rect.top}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+    };
+    const move = (clientX, clientY) => {
+      if (!active) return;
+      const viewport = getViewportSize();
+      const left = clamp(startLeft + clientX - startX, 12, Math.max(12, viewport.width - panel.offsetWidth - 12));
+      const top = clamp(startTop + clientY - startY, 12, Math.max(12, viewport.height - panel.offsetHeight - 12));
+      floatingPanelPosition = { left, top };
+      panel.style.left = `${left}px`;
+      panel.style.top = `${top}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+    };
+    const finish = () => {
+      active = false;
+      pointerId = null;
+    };
+    const doc = getHostDocument();
+    panel.addEventListener('pointerdown', (event) => {
+      if (event.button !== undefined && event.button !== 0) return;
+      if (!canDragFromTarget(event.target)) return;
+      begin(event.clientX, event.clientY, event.pointerId);
+      if (event.cancelable) event.preventDefault();
+      try {
+        panel.setPointerCapture(event.pointerId);
+      } catch (error) {
+        // Pointer capture is optional here.
+      }
+    });
+    doc.addEventListener('pointermove', (event) => {
+      if (!active || (pointerId !== null && event.pointerId !== pointerId)) return;
+      move(event.clientX, event.clientY);
+      if (event.cancelable) event.preventDefault();
+    }, { passive: false });
+    doc.addEventListener('pointerup', (event) => {
+      if (!active || (pointerId !== null && event.pointerId !== pointerId)) return;
+      finish();
+    }, { passive: true });
+    doc.addEventListener('pointercancel', finish, { passive: true });
   }
 
   function syncFloatingButtonState(button) {
@@ -1179,8 +1298,10 @@
       panel.dataset.open = 'false';
       widget.appendChild(panel);
       bindPanel(panel);
+      bindPanelDrag(panel);
     }
     if (panel.parentNode !== widget) widget.appendChild(panel);
+    bindPanelDrag(panel);
     return panel;
   }
 
@@ -1189,6 +1310,8 @@
     if (!panel) return;
     panel.innerHTML = buildPanelHtml();
     bindPanel(panel);
+    bindPanelDrag(panel);
+    applyPanelPosition(panel);
   }
 
   function openPanel() {
@@ -1198,6 +1321,7 @@
     panel.innerHTML = buildPanelHtml();
     bindPanel(panel);
     panel.dataset.open = 'true';
+    applyPanelPosition(panel);
   }
 
   function closePanel() {
